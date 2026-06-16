@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { createServer } from "node:http";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ENTRYPOINT = fileURLToPath(import.meta.url);
@@ -34,6 +37,12 @@ Options:
   --api-key <key>               API key sent as X-API-Key. Prefer env/config for secrets.
   --header <name:value>         Additional static HTTP header. Repeatable.
   --config <path>               JSON config file path. Supports ~ and relative paths.
+  --oauth                       Enable OAuth 2.1/DCR browser login for remote MCP auth.
+  --oauth-login                 Run OAuth login only, cache credentials, then exit.
+  --oauth-callback-port <port>  Loopback callback port. Default: 33418.
+  --oauth-storage <path>        OAuth cache path. Defaults to user config directory.
+  --oauth-scope <scope>         Optional OAuth scope override.
+  --oauth-open-browser <bool>   Open system browser for OAuth. Default: true.
   --allow-http                  Allow non-HTTPS endpoints. Intended only for local development.
   --timeout-ms <ms>             Optional fetch timeout. Disabled by default.
   --max-buffer-size <bytes>     Maximum local stdio message buffer. Default: 10485760.
@@ -46,6 +55,12 @@ Environment:
   MCP_BRIDGE_API_KEY
   MCP_BRIDGE_HEADERS            JSON object of additional headers.
   MCP_BRIDGE_CONFIG
+  MCP_BRIDGE_OAUTH
+  MCP_BRIDGE_OAUTH_LOGIN
+  MCP_BRIDGE_OAUTH_CALLBACK_PORT
+  MCP_BRIDGE_OAUTH_STORAGE
+  MCP_BRIDGE_OAUTH_SCOPE
+  MCP_BRIDGE_OAUTH_OPEN_BROWSER
   MCP_BRIDGE_ALLOW_HTTP
   MCP_BRIDGE_TIMEOUT_MS
   MCP_BRIDGE_MAX_BUFFER_SIZE
@@ -60,6 +75,8 @@ class ConfigError extends Error {
 
 let stdioTransport;
 let remoteTransport;
+let oauthProvider;
+let UnauthorizedErrorCtor;
 let closing = false;
 
 function log(level, message, extra = undefined) {
@@ -94,6 +111,13 @@ function parseArgs(argv) {
       case "--allow-http":
         parsed.allowHttp = true;
         break;
+      case "--oauth":
+        parsed.oauth = true;
+        break;
+      case "--oauth-login":
+        parsed.oauthLogin = true;
+        parsed.oauth = true;
+        break;
       case "--url":
       case "--endpoint":
         parsed.endpoint = readRequiredValue(argv, index, arg);
@@ -113,6 +137,22 @@ function parseArgs(argv) {
         break;
       case "--config":
         parsed.configPath = readRequiredValue(argv, index, arg);
+        index += 1;
+        break;
+      case "--oauth-callback-port":
+        parsed.oauthCallbackPort = readRequiredValue(argv, index, arg);
+        index += 1;
+        break;
+      case "--oauth-storage":
+        parsed.oauthStoragePath = readRequiredValue(argv, index, arg);
+        index += 1;
+        break;
+      case "--oauth-scope":
+        parsed.oauthScope = readRequiredValue(argv, index, arg);
+        index += 1;
+        break;
+      case "--oauth-open-browser":
+        parsed.oauthOpenBrowser = readRequiredValue(argv, index, arg);
         index += 1;
         break;
       case "--timeout-ms":
@@ -190,6 +230,27 @@ async function buildConfig(args, env) {
     args.maxBufferSize ?? env.MCP_BRIDGE_MAX_BUFFER_SIZE ?? fileConfig.maxBufferSize,
     "maxBufferSize"
   ) ?? 10 * 1024 * 1024;
+  const oauthLogin = parseOptionalBoolean(args.oauthLogin)
+    ?? parseOptionalBoolean(env.MCP_BRIDGE_OAUTH_LOGIN)
+    ?? parseOptionalBoolean(fileConfig.oauthLogin)
+    ?? false;
+  const oauthEnabled = oauthLogin || (
+    parseOptionalBoolean(args.oauth)
+    ?? parseOptionalBoolean(env.MCP_BRIDGE_OAUTH)
+    ?? parseOptionalBoolean(fileConfig.oauth)
+    ?? false
+  );
+  const oauthCallbackPort = parseOptionalInteger(
+    args.oauthCallbackPort ?? env.MCP_BRIDGE_OAUTH_CALLBACK_PORT ?? fileConfig.oauthCallbackPort,
+    "oauthCallbackPort"
+  ) ?? 33418;
+  const oauthStoragePath = resolveConfigPath(
+    args.oauthStoragePath ?? env.MCP_BRIDGE_OAUTH_STORAGE ?? fileConfig.oauthStoragePath ?? defaultOAuthStoragePath()
+  );
+  const oauthScope = args.oauthScope ?? env.MCP_BRIDGE_OAUTH_SCOPE ?? fileConfig.oauthScope;
+  const oauthOpenBrowser = parseOptionalBoolean(
+    args.oauthOpenBrowser ?? env.MCP_BRIDGE_OAUTH_OPEN_BROWSER ?? fileConfig.oauthOpenBrowser
+  ) ?? true;
   const headers = normalizeHeaders({
     ...normalizeHeaders(fileConfig.headers ?? {}),
     ...envHeaders,
@@ -211,13 +272,42 @@ async function buildConfig(args, env) {
     throw new ConfigError("maxBufferSize must be at least 1024 bytes.");
   }
 
+  if (oauthCallbackPort < 1024 || oauthCallbackPort > 65535) {
+    throw new ConfigError("oauthCallbackPort must be between 1024 and 65535.");
+  }
+
+  if (oauthEnabled && (bearerToken || apiKey || headers.authorization || headers["x-api-key"])) {
+    throw new ConfigError("Use either OAuth browser login or static bearer/API-key auth, not both.");
+  }
+
   return {
     allowHttp,
     headers,
     maxBufferSize,
+    oauth: oauthEnabled
+      ? {
+        callbackPort: oauthCallbackPort,
+        loginOnly: oauthLogin,
+        redirectUrl: new URL(`http://127.0.0.1:${oauthCallbackPort}/oauth/callback`),
+        openBrowser: oauthOpenBrowser,
+        scope: oauthScope,
+        storagePath: oauthStoragePath
+      }
+      : undefined,
     timeoutMs,
     url
   };
+}
+
+function defaultOAuthStoragePath() {
+  switch (platform()) {
+    case "darwin":
+      return join(homedir(), "Library", "Application Support", "mcp-bridge", "oauth-cache.json");
+    case "win32":
+      return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "mcp-bridge", "oauth-cache.json");
+    default:
+      return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "mcp-bridge", "oauth-cache.json");
+  }
 }
 
 async function loadConfigFile(configPath) {
@@ -397,19 +487,341 @@ function combineAbortSignals(signals) {
   return controller.signal;
 }
 
+class BridgeOAuthProvider {
+  constructor(config) {
+    this.config = config;
+    this.sessionKey = createOAuthSessionKey(config.url, config.oauth.redirectUrl);
+    this.pendingCallback = undefined;
+    this.currentState = undefined;
+    this.codeVerifierValue = undefined;
+  }
+
+  get redirectUrl() {
+    return this.config.oauth.redirectUrl;
+  }
+
+  get clientMetadata() {
+    const metadata = {
+      client_name: "mcp-bridge",
+      redirect_uris: [this.redirectUrl.toString()],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none"
+    };
+
+    if (this.config.oauth.scope) {
+      metadata.scope = this.config.oauth.scope;
+    }
+
+    return metadata;
+  }
+
+  async state() {
+    this.currentState = randomBytes(24).toString("base64url");
+    return this.currentState;
+  }
+
+  async clientInformation() {
+    return (await this.readSession()).clientInformation;
+  }
+
+  async saveClientInformation(clientInformation) {
+    await this.updateSession({ clientInformation });
+  }
+
+  async tokens() {
+    return (await this.readSession()).tokens;
+  }
+
+  async saveTokens(tokens) {
+    await this.updateSession({ tokens });
+  }
+
+  async redirectToAuthorization(authorizationUrl) {
+    if (!this.pendingCallback) {
+      this.pendingCallback = await createOAuthCallbackWaiter({
+        expectedPath: this.redirectUrl.pathname,
+        expectedState: this.currentState,
+        host: this.redirectUrl.hostname,
+        port: Number(this.redirectUrl.port),
+        timeoutMs: 10 * 60 * 1000
+      });
+    }
+
+    log("info", this.config.oauth.openBrowser
+      ? "OAuth authorization required; opening browser"
+      : "OAuth authorization required; browser opening disabled", {
+      oauthUrl: authorizationUrl.toString(),
+      callback: this.redirectUrl.toString()
+    });
+
+    if (!this.config.oauth.openBrowser) {
+      return;
+    }
+
+    await openBrowser(authorizationUrl).catch((error) => {
+      log("error", "unable to open browser automatically", {
+        oauthUrl: authorizationUrl.toString(),
+        message: error.message
+      });
+    });
+  }
+
+  async waitForAuthorizationCode() {
+    if (!this.pendingCallback) {
+      throw new Error("OAuth authorization callback was not started.");
+    }
+
+    try {
+      return await this.pendingCallback.codePromise;
+    } finally {
+      await this.pendingCallback.close();
+      this.pendingCallback = undefined;
+    }
+  }
+
+  async saveCodeVerifier(codeVerifier) {
+    this.codeVerifierValue = codeVerifier;
+  }
+
+  async codeVerifier() {
+    if (!this.codeVerifierValue) {
+      throw new Error("No OAuth PKCE code verifier is available.");
+    }
+    return this.codeVerifierValue;
+  }
+
+  async saveDiscoveryState(discoveryState) {
+    await this.updateSession({ discoveryState });
+  }
+
+  async discoveryState() {
+    return (await this.readSession()).discoveryState;
+  }
+
+  async invalidateCredentials(scope) {
+    const session = await this.readSession();
+
+    if (scope === "all" || scope === "client") {
+      delete session.clientInformation;
+    }
+    if (scope === "all" || scope === "tokens") {
+      delete session.tokens;
+    }
+    if (scope === "all" || scope === "verifier") {
+      this.codeVerifierValue = undefined;
+    }
+    if (scope === "all" || scope === "discovery") {
+      delete session.discoveryState;
+    }
+
+    await this.writeSession(session);
+  }
+
+  async readStore() {
+    try {
+      const raw = await readFile(this.config.oauth.storagePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { sessions: {} };
+      }
+      return {
+        ...parsed,
+        sessions: parsed.sessions && typeof parsed.sessions === "object" && !Array.isArray(parsed.sessions)
+          ? parsed.sessions
+          : {}
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return { sessions: {} };
+      }
+      throw error;
+    }
+  }
+
+  async readSession() {
+    const store = await this.readStore();
+    const session = store.sessions[this.sessionKey];
+    return session && typeof session === "object" && !Array.isArray(session) ? session : {};
+  }
+
+  async updateSession(patch) {
+    await this.writeSession({
+      ...await this.readSession(),
+      ...patch
+    });
+  }
+
+  async writeSession(session) {
+    const store = await this.readStore();
+    store.sessions[this.sessionKey] = session;
+    store.updatedAt = new Date().toISOString();
+    await writeJsonPrivate(this.config.oauth.storagePath, store);
+  }
+}
+
+function createOAuthSessionKey(endpointUrl, redirectUrl) {
+  return createHash("sha256")
+    .update(endpointUrl.toString())
+    .update("\0")
+    .update(redirectUrl.toString())
+    .digest("base64url");
+}
+
+async function writeJsonPrivate(path, value) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(tempPath, path);
+}
+
+async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, port, timeoutMs }) {
+  let server;
+  let settled = false;
+  let readyResolve;
+  let readyReject;
+  let codeResolve;
+  let codeReject;
+  const readyPromise = new Promise((resolveReady, rejectReady) => {
+    readyResolve = resolveReady;
+    readyReject = rejectReady;
+  });
+  const codePromise = new Promise((resolveCode, rejectCode) => {
+    codeResolve = resolveCode;
+    codeReject = rejectCode;
+  });
+
+  const finish = (error, code) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timeout);
+    if (error) {
+      codeReject(error);
+    } else {
+      codeResolve(code);
+    }
+  };
+
+  const timeout = setTimeout(() => {
+    finish(new Error(`OAuth authorization timed out after ${timeoutMs}ms.`));
+  }, timeoutMs);
+  timeout.unref?.();
+
+  server = createServer((request, response) => {
+    const requestUrl = new URL(request.url ?? "/", `http://${host}:${port}`);
+    const code = requestUrl.searchParams.get("code");
+    const state = requestUrl.searchParams.get("state");
+    const error = requestUrl.searchParams.get("error");
+
+    if (requestUrl.pathname !== expectedPath) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+      return;
+    }
+
+    if (error) {
+      response.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+      response.end(oauthHtml("Authorization failed", "Claude Desktop can be reopened after retrying the login."));
+      finish(new Error(`OAuth authorization failed: ${error}`));
+      return;
+    }
+
+    if (!code) {
+      response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Missing authorization code.");
+      finish(new Error("OAuth callback did not include an authorization code."));
+      return;
+    }
+
+    if (expectedState && state !== expectedState) {
+      response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Invalid OAuth state.");
+      finish(new Error("OAuth callback state did not match."));
+      return;
+    }
+
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(oauthHtml("Authorization complete", "You can close this window and return to Claude Desktop."));
+    finish(undefined, code);
+  });
+
+  server.on("error", readyReject);
+  server.listen(port, host, readyResolve);
+  await readyPromise;
+
+  return {
+    codePromise,
+    close: () => new Promise((resolveClose) => {
+      server.close(() => resolveClose());
+    })
+  };
+}
+
+function oauthHtml(title, message) {
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>${title}</title></head>
+<body><h1>${title}</h1><p>${message}</p><script>setTimeout(() => window.close(), 1500);</script></body>
+</html>`;
+}
+
+async function openBrowser(url) {
+  const target = url.toString();
+  const currentPlatform = platform();
+
+  if (currentPlatform === "darwin") {
+    await spawnAndWait("open", [target]);
+    return;
+  }
+
+  if (currentPlatform === "win32") {
+    await spawnAndWait("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Start-Process -FilePath $args[0]",
+      target
+    ]);
+    return;
+  }
+
+  await spawnAndWait("xdg-open", [target]);
+}
+
+function spawnAndWait(command, args) {
+  return new Promise((resolveSpawn, rejectSpawn) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.once("error", rejectSpawn);
+    child.once("spawn", () => {
+      child.unref();
+      resolveSpawn();
+    });
+  });
+}
+
 async function startBridge(config) {
   const [
     { StdioServerTransport },
-    { StreamableHTTPClientTransport }
+    { StreamableHTTPClientTransport },
+    { UnauthorizedError }
   ] = await Promise.all([
     import("@modelcontextprotocol/sdk/server/stdio.js"),
-    import("@modelcontextprotocol/sdk/client/streamableHttp.js")
+    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
+    import("@modelcontextprotocol/sdk/client/auth.js")
   ]);
+  UnauthorizedErrorCtor = UnauthorizedError;
+  oauthProvider = config.oauth ? new BridgeOAuthProvider(config) : undefined;
 
   stdioTransport = new StdioServerTransport(process.stdin, process.stdout, {
     maxBufferSize: config.maxBufferSize
   });
   remoteTransport = new StreamableHTTPClientTransport(config.url, {
+    authProvider: oauthProvider,
     fetch: makeTimeoutFetch(config.timeoutMs),
     requestInit: {
       headers: config.headers
@@ -437,6 +849,7 @@ async function startBridge(config) {
   log("info", "bridge started", {
     allowHttp: config.allowHttp,
     endpoint: safeUrlForLog(config.url),
+    oauth: Boolean(config.oauth),
     timeoutMs: config.timeoutMs ?? "disabled"
   });
 }
@@ -449,9 +862,29 @@ async function forwardMessage(direction, targetTransport, message) {
   try {
     await targetTransport.send(message);
   } catch (error) {
+    if (direction === "stdio->http" && oauthProvider && isUnauthorizedError(error)) {
+      await completeOAuthAndRetry(targetTransport, message).catch(async (authError) => {
+        log("error", "OAuth authorization failed", { message: authError.message });
+        await requestShutdown(1, "OAuth authorization failed");
+      });
+      return;
+    }
+
     log("error", `failed to forward ${direction}`, { message: error.message });
     await requestShutdown(1, `forwarding failed: ${direction}`);
   }
+}
+
+function isUnauthorizedError(error) {
+  return Boolean(UnauthorizedErrorCtor && error instanceof UnauthorizedErrorCtor);
+}
+
+async function completeOAuthAndRetry(targetTransport, message) {
+  log("info", "waiting for OAuth browser authorization");
+  const authorizationCode = await oauthProvider.waitForAuthorizationCode();
+  await targetTransport.finishAuth(authorizationCode);
+  log("info", "OAuth authorization complete; retrying MCP request");
+  await targetTransport.send(message);
 }
 
 function captureProtocolVersion(transport, message) {
@@ -532,6 +965,70 @@ async function closeTransports() {
   await Promise.allSettled(closeOperations);
 }
 
+async function runOAuthLogin(config) {
+  const [
+    { Client },
+    { StreamableHTTPClientTransport },
+    { UnauthorizedError }
+  ] = await Promise.all([
+    import("@modelcontextprotocol/sdk/client/index.js"),
+    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
+    import("@modelcontextprotocol/sdk/client/auth.js")
+  ]);
+
+  UnauthorizedErrorCtor = UnauthorizedError;
+  oauthProvider = new BridgeOAuthProvider(config);
+
+  await connectOAuthClient({
+    Client,
+    StreamableHTTPClientTransport,
+    config,
+    provider: oauthProvider
+  });
+
+  log("info", "OAuth login complete", {
+    endpoint: safeUrlForLog(config.url),
+    storagePath: config.oauth.storagePath
+  });
+}
+
+async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, provider }) {
+  const version = await readPackageVersion();
+  const transport = new StreamableHTTPClientTransport(config.url, {
+    authProvider: provider,
+    fetch: makeTimeoutFetch(config.timeoutMs),
+    requestInit: {
+      headers: config.headers
+    }
+  });
+  const client = new Client({
+    name: "mcp-bridge-login",
+    version
+  }, {
+    capabilities: {}
+  });
+
+  try {
+    await client.connect(transport);
+    await Promise.race([
+      transport.terminateSession(),
+      delay(1500)
+    ]).catch(() => undefined);
+    await client.close();
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      log("info", "waiting for OAuth browser authorization");
+      const authorizationCode = await provider.waitForAuthorizationCode();
+      await transport.finishAuth(authorizationCode);
+      await transport.close().catch(() => undefined);
+      log("info", "OAuth authorization complete; verifying cached credentials");
+      return connectOAuthClient({ Client, StreamableHTTPClientTransport, config, provider });
+    }
+    await transport.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 function delay(milliseconds) {
   return new Promise((resolveDelay) => {
     const timeout = setTimeout(resolveDelay, milliseconds);
@@ -554,6 +1051,11 @@ async function main() {
     }
 
     const config = await buildConfig(args, process.env);
+    if (config.oauth?.loginOnly) {
+      await runOAuthLogin(config);
+      return;
+    }
+
     await startBridge(config);
   } catch (error) {
     const message = error instanceof ConfigError ? error.message : `${error.name}: ${error.message}`;
