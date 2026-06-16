@@ -98,6 +98,8 @@ npx -y github:skroutz/mcp-bridge#main \
   --url https://mcp.example.com/mcp
 ```
 
+Login-only OAuth HTTP requests use a default 30 second timeout so a broken endpoint cannot hang forever. Override it while debugging with `--timeout-ms`, for example `--timeout-ms 10000`.
+
 The bridge will:
 
 - Discover OAuth metadata from the remote MCP server or protected-resource challenge.
@@ -136,6 +138,34 @@ npx -y github:skroutz/mcp-bridge#main \
 }
 ```
 
+If your company endpoint uses an internal CA, add the same CA bundle to both the one-time login command and Claude Desktop config. Prefer this over disabling TLS verification:
+
+```bash
+NODE_EXTRA_CA_CERTS=/absolute/path/to/company-ca.pem \
+npx -y github:skroutz/mcp-bridge#main \
+  --oauth-login \
+  --url https://mcp.example.com/mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "skroutz-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:skroutz/mcp-bridge#main"
+      ],
+      "env": {
+        "MCP_BRIDGE_URL": "https://mcp.example.com/mcp",
+        "MCP_BRIDGE_OAUTH": "true",
+        "NODE_EXTRA_CA_CERTS": "/absolute/path/to/company-ca.pem"
+      }
+    }
+  }
+}
+```
+
 ## Configuration
 
 Environment variables:
@@ -156,6 +186,7 @@ Environment variables:
 | `MCP_BRIDGE_ALLOW_HTTP` | Set to `true` only for local development endpoints. |
 | `MCP_BRIDGE_TIMEOUT_MS` | Optional fetch timeout. Disabled by default because MCP responses may stream. |
 | `MCP_BRIDGE_MAX_BUFFER_SIZE` | Optional local stdio read buffer size in bytes. Default: `10485760`. |
+| `NODE_EXTRA_CA_CERTS` | Node.js TLS option for adding an internal CA bundle. Useful when Claude launches the bridge outside your shell environment. |
 
 CLI flags:
 

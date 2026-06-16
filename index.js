@@ -84,6 +84,40 @@ function log(level, message, extra = undefined) {
   process.stderr.write(`[mcp-bridge] ${level}: ${message}${suffix}\n`);
 }
 
+function formatError(error) {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const cause = error.cause instanceof Error ? `; cause: ${error.cause.message}` : "";
+  return `${error.name}: ${error.message}${cause}`;
+}
+
+function errorMetadata(error) {
+  if (!(error instanceof Error)) {
+    return { message: String(error) };
+  }
+
+  const metadata = {
+    message: error.message,
+    name: error.name
+  };
+
+  if (error.code) {
+    metadata.code = error.code;
+  }
+
+  if (error.cause instanceof Error) {
+    metadata.cause = error.cause.message;
+    metadata.causeName = error.cause.name;
+    if (error.cause.code) {
+      metadata.causeCode = error.cause.code;
+    }
+  }
+
+  return metadata;
+}
+
 function redactSecrets(key, value) {
   if (/authorization|token|api[-_]?key|secret/i.test(key)) {
     return "[redacted]";
@@ -836,8 +870,8 @@ async function startBridge(config) {
     await forwardMessage("http->stdio", stdioTransport, message);
   };
 
-  stdioTransport.onerror = (error) => log("error", "stdio transport error", { message: error.message });
-  remoteTransport.onerror = (error) => log("error", "remote transport error", { message: error.message });
+  stdioTransport.onerror = (error) => log("error", "stdio transport error", errorMetadata(error));
+  remoteTransport.onerror = (error) => log("error", "remote transport error", errorMetadata(error));
   stdioTransport.onclose = () => requestShutdown(0, "stdio closed");
   remoteTransport.onclose = () => requestShutdown(0, "remote transport closed");
 
@@ -850,6 +884,8 @@ async function startBridge(config) {
     allowHttp: config.allowHttp,
     endpoint: safeUrlForLog(config.url),
     oauth: Boolean(config.oauth),
+    tlsExtraCaCerts: Boolean(process.env.NODE_EXTRA_CA_CERTS),
+    tlsVerification: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "disabled" : "default",
     timeoutMs: config.timeoutMs ?? "disabled"
   });
 }
@@ -864,13 +900,13 @@ async function forwardMessage(direction, targetTransport, message) {
   } catch (error) {
     if (direction === "stdio->http" && oauthProvider && isUnauthorizedError(error)) {
       await completeOAuthAndRetry(targetTransport, message).catch(async (authError) => {
-        log("error", "OAuth authorization failed", { message: authError.message });
+        log("error", "OAuth authorization failed", errorMetadata(authError));
         await requestShutdown(1, "OAuth authorization failed");
       });
       return;
     }
 
-    log("error", `failed to forward ${direction}`, { message: error.message });
+    log("error", `failed to forward ${direction}`, errorMetadata(error));
     await requestShutdown(1, `forwarding failed: ${direction}`);
   }
 }
@@ -949,7 +985,7 @@ async function closeTransports() {
       remoteTransport.terminateSession(),
       delay(1500)
     ]).catch((error) => {
-      log("error", "remote session termination failed", { message: error.message });
+      log("error", "remote session termination failed", errorMetadata(error));
     });
   }
 
@@ -967,22 +1003,44 @@ async function closeTransports() {
 
 async function runOAuthLogin(config) {
   const [
+    { auth, UnauthorizedError },
     { Client },
-    { StreamableHTTPClientTransport },
-    { UnauthorizedError }
+    { StreamableHTTPClientTransport }
   ] = await Promise.all([
+    import("@modelcontextprotocol/sdk/client/auth.js"),
     import("@modelcontextprotocol/sdk/client/index.js"),
-    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
-    import("@modelcontextprotocol/sdk/client/auth.js")
+    import("@modelcontextprotocol/sdk/client/streamableHttp.js")
   ]);
 
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = new BridgeOAuthProvider(config);
+  const fetchFn = makeTimeoutFetch(config.timeoutMs ?? 30000);
+
+  log("info", "starting OAuth login", {
+    endpoint: safeUrlForLog(config.url),
+    timeoutMs: config.timeoutMs ?? 30000
+  });
+
+  const result = await auth(oauthProvider, {
+    serverUrl: config.url,
+    fetchFn
+  });
+
+  if (result === "REDIRECT") {
+    log("info", "waiting for OAuth browser authorization");
+    const authorizationCode = await oauthProvider.waitForAuthorizationCode();
+    await auth(oauthProvider, {
+      serverUrl: config.url,
+      authorizationCode,
+      fetchFn
+    });
+  }
 
   await connectOAuthClient({
     Client,
     StreamableHTTPClientTransport,
     config,
+    fetchFn,
     provider: oauthProvider
   });
 
@@ -992,11 +1050,11 @@ async function runOAuthLogin(config) {
   });
 }
 
-async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, provider }) {
+async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn, provider }) {
   const version = await readPackageVersion();
   const transport = new StreamableHTTPClientTransport(config.url, {
     authProvider: provider,
-    fetch: makeTimeoutFetch(config.timeoutMs),
+    fetch: fetchFn ?? makeTimeoutFetch(config.timeoutMs),
     requestInit: {
       headers: config.headers
     }
@@ -1022,7 +1080,7 @@ async function connectOAuthClient({ Client, StreamableHTTPClientTransport, confi
       await transport.finishAuth(authorizationCode);
       await transport.close().catch(() => undefined);
       log("info", "OAuth authorization complete; verifying cached credentials");
-      return connectOAuthClient({ Client, StreamableHTTPClientTransport, config, provider });
+      return connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn, provider });
     }
     await transport.close().catch(() => undefined);
     throw error;
@@ -1058,7 +1116,7 @@ async function main() {
 
     await startBridge(config);
   } catch (error) {
-    const message = error instanceof ConfigError ? error.message : `${error.name}: ${error.message}`;
+    const message = error instanceof ConfigError ? error.message : formatError(error);
     log("error", message);
     process.exitCode = 1;
   }
