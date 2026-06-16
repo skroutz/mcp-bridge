@@ -1,0 +1,32 @@
+{
+  "name": "mcp-bridge",
+  "version": "0.1.0",
+  "description": "Secure stdio-to-Streamable-HTTP MCP bridge for Claude Desktop.",
+  "type": "module",
+  "bin": {
+    "mcp-bridge": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "check": "node --check index.js",
+    "pack:dry-run": "npm --cache .npm-cache pack --dry-run",
+    "start": "node ./index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "streamable-http",
+    "stdio"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}
