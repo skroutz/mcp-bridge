@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 
 import { existsSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const ENTRYPOINT = fileURLToPath(import.meta.url);
@@ -43,6 +45,7 @@ Options:
   --oauth-storage <path>        OAuth cache path. Defaults to user config directory.
   --oauth-scope <scope>         Optional OAuth scope override.
   --oauth-open-browser <bool>   Open system browser for OAuth. Default: true.
+  --ca-bundle <path>            Optional PEM CA bundle used by the bridge HTTP client.
   --allow-http                  Allow non-HTTPS endpoints. Intended only for local development.
   --timeout-ms <ms>             Optional fetch timeout. Disabled by default.
   --max-buffer-size <bytes>     Maximum local stdio message buffer. Default: 10485760.
@@ -61,6 +64,7 @@ Environment:
   MCP_BRIDGE_OAUTH_STORAGE
   MCP_BRIDGE_OAUTH_SCOPE
   MCP_BRIDGE_OAUTH_OPEN_BROWSER
+  MCP_BRIDGE_CA_BUNDLE
   MCP_BRIDGE_ALLOW_HTTP
   MCP_BRIDGE_TIMEOUT_MS
   MCP_BRIDGE_MAX_BUFFER_SIZE
@@ -189,6 +193,10 @@ function parseArgs(argv) {
         parsed.oauthOpenBrowser = readRequiredValue(argv, index, arg);
         index += 1;
         break;
+      case "--ca-bundle":
+        parsed.caBundlePath = readRequiredValue(argv, index, arg);
+        index += 1;
+        break;
       case "--timeout-ms":
         parsed.timeoutMs = readRequiredValue(argv, index, arg);
         index += 1;
@@ -285,6 +293,10 @@ async function buildConfig(args, env) {
   const oauthOpenBrowser = parseOptionalBoolean(
     args.oauthOpenBrowser ?? env.MCP_BRIDGE_OAUTH_OPEN_BROWSER ?? fileConfig.oauthOpenBrowser
   ) ?? true;
+  const caBundlePath = resolveConfigPath(
+    args.caBundlePath ?? env.MCP_BRIDGE_CA_BUNDLE ?? fileConfig.caBundle ?? fileConfig.caBundlePath
+  );
+  const caBundle = caBundlePath ? await readCaBundle(caBundlePath) : undefined;
   const headers = normalizeHeaders({
     ...normalizeHeaders(fileConfig.headers ?? {}),
     ...envHeaders,
@@ -316,6 +328,7 @@ async function buildConfig(args, env) {
 
   return {
     allowHttp,
+    caBundle,
     headers,
     maxBufferSize,
     oauth: oauthEnabled
@@ -481,12 +494,41 @@ function validateEndpoint(endpoint, allowHttp) {
   return url;
 }
 
-function makeTimeoutFetch(timeoutMs) {
-  if (!timeoutMs) {
+async function readCaBundle(caBundlePath) {
+  if (!existsSync(caBundlePath)) {
+    throw new ConfigError(`CA bundle file does not exist: ${caBundlePath}`);
+  }
+
+  try {
+    const pem = await readFile(caBundlePath, "utf8");
+    if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
+      throw new ConfigError(`CA bundle does not look like a PEM certificate bundle: ${caBundlePath}`);
+    }
+    return {
+      path: caBundlePath,
+      pem
+    };
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      throw error;
+    }
+    throw new ConfigError(`Unable to read CA bundle ${caBundlePath}: ${error.message}`);
+  }
+}
+
+function makeBridgeFetch(config, defaultTimeoutMs = undefined) {
+  const timeoutMs = config.timeoutMs ?? defaultTimeoutMs;
+  const baseFetch = config.caBundle ? makeCaBundleFetch(config.caBundle.pem) : fetch;
+
+  if (!timeoutMs && !config.caBundle) {
     return undefined;
   }
 
   return async (url, init = {}) => {
+    if (!timeoutMs) {
+      return await baseFetch(url, init);
+    }
+
     const timeoutController = new AbortController();
     const timeout = setTimeout(() => {
       timeoutController.abort(new Error(`Request timed out after ${timeoutMs}ms.`));
@@ -497,7 +539,7 @@ function makeTimeoutFetch(timeoutMs) {
       : combineAbortSignals(signals);
 
     try {
-      return await fetch(url, {
+      return await baseFetch(url, {
         ...init,
         signal
       });
@@ -505,6 +547,139 @@ function makeTimeoutFetch(timeoutMs) {
       clearTimeout(timeout);
     }
   };
+}
+
+function makeCaBundleFetch(ca) {
+  return async (url, init = {}) => fetchWithNodeHttp(url, init, { ca, redirectCount: 0 });
+}
+
+async function fetchWithNodeHttp(input, init = {}, { ca, redirectCount }) {
+  const url = new URL(input instanceof Request ? input.url : input);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new TypeError(`Unsupported protocol for bridge fetch: ${url.protocol}`);
+  }
+
+  const method = init.method ?? (input instanceof Request ? input.method : "GET");
+  const headers = headersToObject(init.headers ?? (input instanceof Request ? input.headers : undefined));
+  const body = await normalizeFetchBody(init.body);
+  const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest;
+
+  return new Promise((resolveFetch, rejectFetch) => {
+    if (init.signal?.aborted) {
+      rejectFetch(init.signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+      return;
+    }
+
+    const request = requestImpl(url, {
+      ca: url.protocol === "https:" ? ca : undefined,
+      headers,
+      method
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      const location = response.headers.location;
+
+      if (isRedirectStatus(status) && location && redirectCount < 5) {
+        response.resume();
+        const redirectUrl = new URL(location, url);
+        const redirectInit = {
+          ...init,
+          body: status === 303 ? undefined : init.body,
+          headers,
+          method: status === 303 ? "GET" : method
+        };
+        fetchWithNodeHttp(redirectUrl, redirectInit, { ca, redirectCount: redirectCount + 1 })
+          .then(resolveFetch, rejectFetch);
+        return;
+      }
+
+      const responseBody = responseCanHaveBody(status) ? Readable.toWeb(response) : null;
+      if (!responseBody) {
+        response.resume();
+      }
+      resolveFetch(new Response(responseBody, {
+        headers: responseHeaders(response.headers),
+        status,
+        statusText: response.statusMessage
+      }));
+    });
+
+    request.once("error", rejectFetch);
+    init.signal?.addEventListener("abort", () => {
+      request.destroy(init.signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+    }, { once: true });
+
+    if (body === undefined) {
+      request.end();
+      return;
+    }
+
+    if (body instanceof Readable) {
+      body.once("error", rejectFetch);
+      body.pipe(request);
+      return;
+    }
+
+    request.end(body);
+  });
+}
+
+function headersToObject(headersInit) {
+  if (!headersInit) {
+    return {};
+  }
+
+  const headers = new Headers(headersInit);
+  return Object.fromEntries(headers.entries());
+}
+
+function responseHeaders(headers) {
+  const normalized = new Headers();
+
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        normalized.append(name, item);
+      }
+      continue;
+    }
+    normalized.set(name, String(value));
+  }
+
+  return normalized;
+}
+
+async function normalizeFetchBody(body) {
+  if (body === undefined || body === null) {
+    return undefined;
+  }
+  if (typeof body === "string" || Buffer.isBuffer(body) || body instanceof Readable) {
+    return body;
+  }
+  if (body instanceof URLSearchParams) {
+    return body.toString();
+  }
+  if (body instanceof ArrayBuffer) {
+    return Buffer.from(body);
+  }
+  if (ArrayBuffer.isView(body)) {
+    return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  }
+  if (typeof Blob !== "undefined" && body instanceof Blob) {
+    return Buffer.from(await body.arrayBuffer());
+  }
+
+  throw new TypeError(`Unsupported request body type for bridge fetch: ${body.constructor?.name ?? typeof body}`);
+}
+
+function isRedirectStatus(status) {
+  return [301, 302, 303, 307, 308].includes(status);
+}
+
+function responseCanHaveBody(status) {
+  return ![204, 205, 304].includes(status);
 }
 
 function combineAbortSignals(signals) {
@@ -856,7 +1031,7 @@ async function startBridge(config) {
   });
   remoteTransport = new StreamableHTTPClientTransport(config.url, {
     authProvider: oauthProvider,
-    fetch: makeTimeoutFetch(config.timeoutMs),
+    fetch: makeBridgeFetch(config),
     requestInit: {
       headers: config.headers
     }
@@ -884,6 +1059,8 @@ async function startBridge(config) {
     allowHttp: config.allowHttp,
     endpoint: safeUrlForLog(config.url),
     oauth: Boolean(config.oauth),
+    bridgeCaBundle: Boolean(config.caBundle),
+    bridgeCaBundlePath: config.caBundle?.path,
     tlsExtraCaCerts: Boolean(process.env.NODE_EXTRA_CA_CERTS),
     tlsVerification: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "disabled" : "default",
     timeoutMs: config.timeoutMs ?? "disabled"
@@ -1014,9 +1191,11 @@ async function runOAuthLogin(config) {
 
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = new BridgeOAuthProvider(config);
-  const fetchFn = makeTimeoutFetch(config.timeoutMs ?? 30000);
+  const fetchFn = makeBridgeFetch(config, 30000);
 
   log("info", "starting OAuth login", {
+    bridgeCaBundle: Boolean(config.caBundle),
+    bridgeCaBundlePath: config.caBundle?.path,
     endpoint: safeUrlForLog(config.url),
     timeoutMs: config.timeoutMs ?? 30000
   });
@@ -1054,7 +1233,7 @@ async function connectOAuthClient({ Client, StreamableHTTPClientTransport, confi
   const version = await readPackageVersion();
   const transport = new StreamableHTTPClientTransport(config.url, {
     authProvider: provider,
-    fetch: fetchFn ?? makeTimeoutFetch(config.timeoutMs),
+    fetch: fetchFn ?? makeBridgeFetch(config),
     requestInit: {
       headers: config.headers
     }

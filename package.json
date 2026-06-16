@@ -8,13 +8,19 @@
   },
   "files": [
     "index.js",
-    "README.md"
+    "README.md",
+    "mcpb",
+    "scripts/build-mcpb.mjs",
+    "scripts/check-stdio-runtime.mjs",
+    "scripts/emulate-mcpb.mjs"
   ],
   "engines": {
-    "node": ">=20.11"
+    "node": ">=24.0.0"
   },
   "scripts": {
-    "check": "node --check index.js",
+    "build:mcpb": "node ./scripts/build-mcpb.mjs",
+    "check": "node --check index.js && node --check scripts/build-mcpb.mjs && node --check scripts/check-stdio-runtime.mjs && node --check scripts/emulate-mcpb.mjs && node scripts/check-stdio-runtime.mjs",
+    "emulate:mcpb": "node ./scripts/emulate-mcpb.mjs",
     "pack:dry-run": "npm --cache .npm-cache pack --dry-run",
     "start": "node ./index.js"
   },

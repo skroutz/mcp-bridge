@@ -10,7 +10,7 @@ The bridge intentionally uses only the official `@modelcontextprotocol/sdk` runt
 
 ## Requirements
 
-- Node.js 20.11 or newer on macOS or Windows.
+- Node.js 24 or newer on macOS or Windows.
 - A reachable Streamable-HTTP MCP endpoint, for example `https://mcp.example.com/mcp`.
 - Optional OAuth 2.1/DCR browser login, bearer token, API key, or static headers required by your firewalled endpoint.
 
@@ -87,6 +87,74 @@ OAuth-backed configuration:
 ```
 
 On Windows, if Claude cannot resolve `npx` directly, run `where npx` in Command Prompt and set `command` to the full `npx.cmd` path.
+
+## Claude MCPB Extension
+
+This repository can also produce a Claude Desktop MCPB extension for organization-wide distribution. The bundle vendors the bridge code and `node_modules` into a single `.mcpb` zip archive, so users do not need to install Node dependencies or edit `claude_desktop_config.json` manually.
+
+The committed MCPB manifest is a public-safe template. Do not commit generated organization-specific `.mcpb` files or manifests with internal endpoints.
+
+Build the bundle from a clean checkout:
+
+```bash
+npm ci --omit=dev
+npm run build:mcpb
+```
+
+The generated file is written to `dist/skroutz-mcp-bridge-<version>.mcpb`.
+
+The MCPB template lives at `mcpb/manifest.template.json`. It configures Claude Desktop to run the bundled bridge with:
+
+- `MCP_BRIDGE_URL` from the extension's Remote MCP URL setting.
+- `MCP_BRIDGE_OAUTH=true` so the remote server's OAuth/DCR browser flow is used.
+- `MCP_BRIDGE_OAUTH_CALLBACK_PORT` from the extension's OAuth callback port setting.
+- Optional `NODE_EXTRA_CA_CERTS` and `MCP_BRIDGE_CA_BUNDLE` from either a bundled CA certificate or the extension's Internal CA certificate file setting.
+
+Build an organization-specific artifact by passing release-time environment variables. The generated artifact remains ignored by git:
+
+```bash
+MCPB_NAME="your-org-mcp" \
+MCPB_DISPLAY_NAME="Your Org MCP" \
+MCPB_REMOTE_MCP_URL="https://mcp.example.com/mcp" \
+MCPB_PRIVACY_POLICIES="https://example.com/privacy" \
+npm run build:mcpb
+```
+
+When `MCPB_REMOTE_MCP_URL` is set, the generated manifest bakes the URL and OAuth callback port directly into the private artifact instead of asking each user to configure them during installation. Override the fixed callback port with `MCPB_OAUTH_CALLBACK_PORT` if needed.
+
+The npm/npx package and MCPB extension require Node.js 24 or newer.
+
+If Claude needs a corporate TLS proxy CA to reach the remote MCP server, keep the PEM file outside git and bundle it only into the generated `.mcpb`:
+
+```bash
+MCPB_CA_BUNDLE="./company-ca.pem" \
+npm run build:mcpb
+```
+
+When `MCPB_CA_BUNDLE` is set, the build copies the PEM to `certs/ca-bundle.pem` inside the ignored `.mcpb` artifact and sets both `NODE_EXTRA_CA_CERTS=${__dirname}/certs/ca-bundle.pem` and `MCP_BRIDGE_CA_BUNDLE=${__dirname}/certs/ca-bundle.pem` in the generated manifest. `MCP_BRIDGE_CA_BUNDLE` is read by the bridge itself, so TLS trust does not depend only on Claude Desktop honoring Node's startup CA environment variable. Do not use this for private keys or client certificates.
+
+For Claude.ai organization settings, upload the generated `.mcpb` as a local MCP extension. Users should then see the configured local MCP server in Claude Desktop without pasting JSON. On first use, the bridge will start the remote OAuth flow and cache the resulting client registration and tokens in the user's OS config directory.
+
+Before uploading a new MCPB release:
+
+```bash
+npm run check
+npm run pack:dry-run
+npm run build:mcpb
+unzip -l dist/skroutz-mcp-bridge-$(node -p "require('./package.json').version").mcpb | head -50
+```
+
+To debug the exact MCPB launch path from Terminal, run the emulator against either a `.mcpb` file or Claude's already-unpacked extension directory:
+
+```bash
+npm run emulate:mcpb -- --mcpb dist/skroutz-mcp-bridge-0.1.0.mcpb --clean-env
+```
+
+```bash
+npm run emulate:mcpb -- --mcpb "/path/to/unpacked/extension-directory" --clean-env
+```
+
+The emulator reads `manifest.json`, resolves `${__dirname}`, starts the configured Node server with the manifest environment, sends a Claude-style `initialize` request, and writes captured output to `dist/mcpb-emulate.stdout` and `dist/mcpb-emulate.stderr`.
 
 ## OAuth Login
 
@@ -183,10 +251,11 @@ Environment variables:
 | `MCP_BRIDGE_OAUTH_STORAGE` | Optional OAuth cache file path. Defaults to the user config directory. |
 | `MCP_BRIDGE_OAUTH_SCOPE` | Optional OAuth scope override. |
 | `MCP_BRIDGE_OAUTH_OPEN_BROWSER` | Set to `false` for headless login/debugging. The authorization URL is still written to stderr. |
+| `MCP_BRIDGE_CA_BUNDLE` | Optional PEM CA bundle read directly by the bridge HTTP client for MCP and OAuth requests. |
 | `MCP_BRIDGE_ALLOW_HTTP` | Set to `true` only for local development endpoints. |
 | `MCP_BRIDGE_TIMEOUT_MS` | Optional fetch timeout. Disabled by default because MCP responses may stream. |
 | `MCP_BRIDGE_MAX_BUFFER_SIZE` | Optional local stdio read buffer size in bytes. Default: `10485760`. |
-| `NODE_EXTRA_CA_CERTS` | Node.js TLS option for adding an internal CA bundle. Useful when Claude launches the bridge outside your shell environment. |
+| `NODE_EXTRA_CA_CERTS` | Node.js TLS option for adding an internal CA bundle. MCPB builds also set `MCP_BRIDGE_CA_BUNDLE` so the bridge can load the PEM itself. |
 
 CLI flags:
 
@@ -210,6 +279,7 @@ Config file:
   "oauth": false,
   "oauthCallbackPort": 33418,
   "oauthOpenBrowser": true,
+  "caBundle": "/absolute/path/to/company-ca.pem",
   "timeoutMs": 120000,
   "maxBufferSize": 10485760
 }
@@ -234,6 +304,7 @@ Precedence is config file, then environment variables, then CLI flags.
 npm install
 npm run check
 npm run pack:dry-run
+npm run build:mcpb
 ```
 
 Run against a local development MCP server:
@@ -250,6 +321,7 @@ MCP_BRIDGE_ALLOW_HTTP=true MCP_BRIDGE_URL=http://127.0.0.1:3000/mcp npm start
    npm ci
    npm run check
    npm run pack:dry-run
+   npm run build:mcpb
    ```
 
 2. Update `package.json` version:
@@ -275,17 +347,20 @@ MCP_BRIDGE_ALLOW_HTTP=true MCP_BRIDGE_URL=http://127.0.0.1:3000/mcp npm start
 5. Create a GitHub release from the tag. Include:
 
    - The exact `npx -y github:skroutz/mcp-bridge#v0.1.1` command.
+   - The generated `.mcpb` artifact from `dist/`.
    - Supported Node.js version.
    - Configuration changes.
    - Security notes and dependency version.
 
-6. Smoke-test the release tag on macOS and Windows:
+6. Upload the `.mcpb` artifact to Claude.ai organization settings for managed local-MCP distribution.
+
+7. Smoke-test the release tag on macOS and Windows:
 
    ```bash
    npx -y github:skroutz/mcp-bridge#v0.1.1 --help
    ```
 
-7. Optional npm publication:
+8. Optional npm publication:
 
    ```bash
    npm publish --provenance

@@ -1,0 +1,77 @@
+{
+  "manifest_version": "0.3",
+  "name": "skroutz-mcp-bridge",
+  "display_name": "Skroutz MCP Bridge",
+  "version": "0.0.0",
+  "description": "Local Claude Desktop bridge for a secure remote MCP server.",
+  "long_description": "Connects Claude Desktop to a remote Streamable-HTTP MCP server through a local stdio bridge. The bridge supports OAuth login through the official MCP TypeScript SDK.",
+  "author": {
+    "name": "Skroutz"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skroutz/mcp-bridge.git"
+  },
+  "homepage": "https://github.com/skroutz/mcp-bridge",
+  "documentation": "https://github.com/skroutz/mcp-bridge#readme",
+  "support": "https://github.com/skroutz/mcp-bridge/issues",
+  "license": "MIT",
+  "keywords": [
+    "skroutz",
+    "mcp",
+    "claude",
+    "oauth"
+  ],
+  "tools_generated": true,
+  "prompts_generated": true,
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "MCP_BRIDGE_URL": "${user_config.remote_mcp_url}",
+        "MCP_BRIDGE_OAUTH": "true",
+        "MCP_BRIDGE_OAUTH_CALLBACK_PORT": "${user_config.oauth_callback_port}",
+        "NODE_EXTRA_CA_CERTS": "${user_config.ca_bundle}",
+        "MCP_BRIDGE_CA_BUNDLE": "${user_config.ca_bundle}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
+  },
+  "user_config": {
+    "remote_mcp_url": {
+      "type": "string",
+      "title": "Remote MCP URL",
+      "description": "Streamable-HTTP MCP endpoint for the remote server.",
+      "required": true,
+      "default": "https://mcp.example.com/mcp"
+    },
+    "oauth_callback_port": {
+      "type": "number",
+      "title": "OAuth callback port",
+      "description": "Local loopback port used during OAuth login.",
+      "required": true,
+      "default": 33418,
+      "min": 1024,
+      "max": 65535
+    },
+    "ca_bundle": {
+      "type": "file",
+      "title": "Internal CA certificate",
+      "description": "Optional PEM certificate bundle used when the MCP endpoint is signed by an internal CA.",
+      "required": false
+    }
+  }
+}
