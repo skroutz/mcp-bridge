@@ -768,11 +768,14 @@ class BridgeOAuthProvider {
       return;
     }
 
-    await openBrowser(authorizationUrl).catch((error) => {
+    await openBrowser(authorizationUrl).then((method) => {
+      log("info", "OAuth browser launch command completed", { method });
+    }).catch((error) => {
       log("error", "unable to open browser automatically", {
         oauthUrl: authorizationUrl.toString(),
         message: error.message
       });
+      throw error;
     });
   }
 
@@ -982,21 +985,56 @@ async function openBrowser(url) {
 
   if (currentPlatform === "darwin") {
     await spawnAndWait("open", [target]);
-    return;
+    return "open";
   }
 
   if (currentPlatform === "win32") {
-    await spawnAndWait("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      "Start-Process -FilePath $args[0]",
-      target
-    ]);
-    return;
+    return await openBrowserWindows(target);
   }
 
   await spawnAndWait("xdg-open", [target]);
+  return "xdg-open";
+}
+
+async function openBrowserWindows(target) {
+  const commands = [
+    {
+      command: "rundll32.exe",
+      args: ["url.dll,FileProtocolHandler", target],
+      method: "rundll32-url"
+    },
+    {
+      command: "explorer.exe",
+      args: [target],
+      method: "explorer-url"
+    },
+    {
+      command: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Start-Process -FilePath $args[0]",
+        target
+      ],
+      method: "powershell-start-process"
+    }
+  ];
+
+  const failures = [];
+
+  for (const candidate of commands) {
+    try {
+      await spawnAndWait(candidate.command, candidate.args);
+      return candidate.method;
+    } catch (error) {
+      failures.push(`${candidate.method}: ${error.message}`);
+    }
+  }
+
+  throw new Error(failures.join("; "));
 }
 
 function spawnAndWait(command, args) {
@@ -1078,6 +1116,7 @@ async function forwardMessage(direction, targetTransport, message) {
     if (direction === "stdio->http" && oauthProvider && isUnauthorizedError(error)) {
       await completeOAuthAndRetry(targetTransport, message).catch(async (authError) => {
         log("error", "OAuth authorization failed", errorMetadata(authError));
+        await invalidateOAuthSession(oauthProvider, "OAuth authorization failed");
         await requestShutdown(1, "OAuth authorization failed");
       });
       return;
@@ -1094,10 +1133,28 @@ function isUnauthorizedError(error) {
 
 async function completeOAuthAndRetry(targetTransport, message) {
   log("info", "waiting for OAuth browser authorization");
-  const authorizationCode = await oauthProvider.waitForAuthorizationCode();
-  await targetTransport.finishAuth(authorizationCode);
+  const authorizationCode = await oauthProvider.waitForAuthorizationCode().catch(async (error) => {
+    await invalidateOAuthSession(oauthProvider, "OAuth browser authorization failed");
+    throw error;
+  });
+  await targetTransport.finishAuth(authorizationCode).catch(async (error) => {
+    await invalidateOAuthSession(oauthProvider, "OAuth token exchange failed");
+    throw error;
+  });
   log("info", "OAuth authorization complete; retrying MCP request");
   await targetTransport.send(message);
+}
+
+async function invalidateOAuthSession(provider, reason) {
+  if (!provider?.invalidateCredentials) {
+    return;
+  }
+
+  await provider.invalidateCredentials("all").then(() => {
+    log("info", "cleared OAuth cache for current session", { reason });
+  }).catch((error) => {
+    log("error", "failed to clear OAuth cache for current session", errorMetadata(error));
+  });
 }
 
 function captureProtocolVersion(transport, message) {
@@ -1203,15 +1260,24 @@ async function runOAuthLogin(config) {
   const result = await auth(oauthProvider, {
     serverUrl: config.url,
     fetchFn
+  }).catch(async (error) => {
+    await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
+    throw error;
   });
 
   if (result === "REDIRECT") {
     log("info", "waiting for OAuth browser authorization");
-    const authorizationCode = await oauthProvider.waitForAuthorizationCode();
+    const authorizationCode = await oauthProvider.waitForAuthorizationCode().catch(async (error) => {
+      await invalidateOAuthSession(oauthProvider, "OAuth browser authorization failed");
+      throw error;
+    });
     await auth(oauthProvider, {
       serverUrl: config.url,
       authorizationCode,
       fetchFn
+    }).catch(async (error) => {
+      await invalidateOAuthSession(oauthProvider, "OAuth token exchange failed");
+      throw error;
     });
   }
 
@@ -1255,8 +1321,14 @@ async function connectOAuthClient({ Client, StreamableHTTPClientTransport, confi
   } catch (error) {
     if (isUnauthorizedError(error)) {
       log("info", "waiting for OAuth browser authorization");
-      const authorizationCode = await provider.waitForAuthorizationCode();
-      await transport.finishAuth(authorizationCode);
+      const authorizationCode = await provider.waitForAuthorizationCode().catch(async (authError) => {
+        await invalidateOAuthSession(provider, "OAuth browser authorization failed");
+        throw authError;
+      });
+      await transport.finishAuth(authorizationCode).catch(async (authError) => {
+        await invalidateOAuthSession(provider, "OAuth token exchange failed");
+        throw authError;
+      });
       await transport.close().catch(() => undefined);
       log("info", "OAuth authorization complete; verifying cached credentials");
       return connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn, provider });
