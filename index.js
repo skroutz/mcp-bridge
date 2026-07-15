@@ -992,8 +992,47 @@ async function openBrowser(url) {
     return await openBrowserWindows(target);
   }
 
-  await spawnAndWait("xdg-open", [target]);
-  return "xdg-open";
+  return await openBrowserLinux(target);
+}
+
+function openBrowserLinuxCommands(target) {
+  const commands = [];
+  const browserEnv = process.env.BROWSER;
+
+  if (browserEnv) {
+    for (const entry of browserEnv.split(":")) {
+      const command = entry.trim();
+      if (!command) {
+        continue;
+      }
+      commands.push(command.includes("%s")
+        ? { command: "sh", args: ["-c", `${command} "$0"`, target], method: `browser-env:${command}` }
+        : { command, args: [target], method: `browser-env:${command}` });
+    }
+  }
+
+  for (const command of ["xdg-open", "gio", "gnome-open", "kde-open5", "kde-open", "wslview", "x-www-browser", "www-browser"]) {
+    commands.push(command === "gio"
+      ? { command: "gio", args: ["open", target], method: "gio-open" }
+      : { command, args: [target], method: command });
+  }
+
+  return commands;
+}
+
+async function openBrowserLinux(target) {
+  const failures = [];
+
+  for (const candidate of openBrowserLinuxCommands(target)) {
+    try {
+      await spawnAndWait(candidate.command, candidate.args);
+      return candidate.method;
+    } catch (error) {
+      failures.push(`${candidate.method}: ${error.message}`);
+    }
+  }
+
+  throw new Error(`No Linux URL opener succeeded. Tried: ${failures.join("; ")}`);
 }
 
 async function openBrowserWindows(target) {
