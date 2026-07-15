@@ -41,6 +41,7 @@ Options:
   --config <path>               JSON config file path. Supports ~ and relative paths.
   --oauth                       Enable OAuth 2.1/DCR browser login for remote MCP auth.
   --oauth-login                 Run OAuth login only, cache credentials, then exit.
+  --oauth-clear-cache           Clear the current OAuth session before continuing.
   --oauth-callback-port <port>  Loopback callback port. Default: 33418.
   --oauth-storage <path>        OAuth cache path. Defaults to user config directory.
   --oauth-scope <scope>         Optional OAuth scope override.
@@ -60,6 +61,7 @@ Environment:
   MCP_BRIDGE_CONFIG
   MCP_BRIDGE_OAUTH
   MCP_BRIDGE_OAUTH_LOGIN
+  MCP_BRIDGE_OAUTH_CLEAR_CACHE
   MCP_BRIDGE_OAUTH_CALLBACK_PORT
   MCP_BRIDGE_OAUTH_STORAGE
   MCP_BRIDGE_OAUTH_SCOPE
@@ -76,6 +78,17 @@ class ConfigError extends Error {
     this.name = "ConfigError";
   }
 }
+
+class OAuthAuthorizationError extends Error {
+  constructor(error, description = undefined) {
+    super(description ? `OAuth authorization failed: ${error}: ${description}` : `OAuth authorization failed: ${error}`);
+    this.name = "OAuthAuthorizationError";
+    this.oauthError = error;
+  }
+}
+
+const OAUTH_CACHE_SESSION_VERSION = 1;
+const STALE_CLIENT_OAUTH_ERRORS = new Set(["invalid_client", "unauthorized_client"]);
 
 let stdioTransport;
 let remoteTransport;
@@ -154,6 +167,10 @@ function parseArgs(argv) {
         break;
       case "--oauth-login":
         parsed.oauthLogin = true;
+        parsed.oauth = true;
+        break;
+      case "--oauth-clear-cache":
+        parsed.oauthClearCache = true;
         parsed.oauth = true;
         break;
       case "--url":
@@ -276,7 +293,11 @@ async function buildConfig(args, env) {
     ?? parseOptionalBoolean(env.MCP_BRIDGE_OAUTH_LOGIN)
     ?? parseOptionalBoolean(fileConfig.oauthLogin)
     ?? false;
-  const oauthEnabled = oauthLogin || (
+  const oauthClearCache = parseOptionalBoolean(args.oauthClearCache)
+    ?? parseOptionalBoolean(env.MCP_BRIDGE_OAUTH_CLEAR_CACHE)
+    ?? parseOptionalBoolean(fileConfig.oauthClearCache)
+    ?? false;
+  const oauthEnabled = oauthLogin || oauthClearCache || (
     parseOptionalBoolean(args.oauth)
     ?? parseOptionalBoolean(env.MCP_BRIDGE_OAUTH)
     ?? parseOptionalBoolean(fileConfig.oauth)
@@ -334,6 +355,7 @@ async function buildConfig(args, env) {
     oauth: oauthEnabled
       ? {
         callbackPort: oauthCallbackPort,
+        clearCache: oauthClearCache,
         loginOnly: oauthLogin,
         redirectUrl: new URL(`http://127.0.0.1:${oauthCallbackPort}/oauth/callback`),
         openBrowser: oauthOpenBrowser,
@@ -578,7 +600,7 @@ async function fetchWithNodeHttp(input, init = {}, { ca, redirectCount }) {
       const status = response.statusCode ?? 0;
       const location = response.headers.location;
 
-      if (isRedirectStatus(status) && location && redirectCount < 5) {
+      if (isRedirectStatus(status) && location && redirectCount < 5 && init.redirect !== "manual") {
         response.resume();
         const redirectUrl = new URL(location, url);
         const redirectInit = {
@@ -700,9 +722,11 @@ class BridgeOAuthProvider {
   constructor(config) {
     this.config = config;
     this.sessionKey = createOAuthSessionKey(config.url, config.oauth.redirectUrl);
+    this.sessionFingerprint = createOAuthSessionFingerprint(config.url, config.oauth.redirectUrl, config.oauth.scope);
     this.pendingCallback = undefined;
     this.currentState = undefined;
     this.codeVerifierValue = undefined;
+    this.staleClientRecoveryUsed = false;
   }
 
   get redirectUrl() {
@@ -731,7 +755,13 @@ class BridgeOAuthProvider {
   }
 
   async clientInformation() {
-    return (await this.readSession()).clientInformation;
+    const session = await this.readSession();
+    if (clientRegistrationExpired(session.clientInformation)) {
+      await this.invalidateCredentials("all");
+      log("info", "cleared expired OAuth client registration for current session");
+      return undefined;
+    }
+    return session.clientInformation;
   }
 
   async saveClientInformation(clientInformation) {
@@ -739,7 +769,13 @@ class BridgeOAuthProvider {
   }
 
   async tokens() {
-    return (await this.readSession()).tokens;
+    const session = await this.readSession();
+    if (clientRegistrationExpired(session.clientInformation)) {
+      await this.invalidateCredentials("all");
+      log("info", "cleared expired OAuth client registration for current session");
+      return undefined;
+    }
+    return session.tokens;
   }
 
   async saveTokens(tokens) {
@@ -747,6 +783,8 @@ class BridgeOAuthProvider {
   }
 
   async redirectToAuthorization(authorizationUrl) {
+    await this.assertAuthorizationClientIsValid(authorizationUrl);
+
     if (!this.pendingCallback) {
       this.pendingCallback = await createOAuthCallbackWaiter({
         expectedPath: this.redirectUrl.pathname,
@@ -777,6 +815,33 @@ class BridgeOAuthProvider {
       });
       throw error;
     });
+  }
+
+  async assertAuthorizationClientIsValid(authorizationUrl) {
+    const fetchFn = makeBridgeFetch(this.config, 10_000) ?? fetch;
+    let response;
+
+    try {
+      response = await fetchFn(authorizationUrl, { redirect: "manual" });
+    } catch (error) {
+      // The browser may have network access or session configuration that this
+      // utility process lacks. Preflight is an enhancement, never a reason to
+      // block a normal interactive OAuth attempt.
+      log("info", "unable to preflight OAuth authorization endpoint; continuing in browser", errorMetadata(error));
+      return;
+    }
+
+    if (response.status !== 400) {
+      await response.body?.cancel();
+      return;
+    }
+
+    const body = await response.text().catch(() => "");
+    if (/\binvalid[ _-]?client\b/i.test(body)) {
+      throw new OAuthAuthorizationError("invalid_client");
+    }
+
+    log("info", "OAuth authorization endpoint returned HTTP 400 without an invalid_client error; continuing in browser");
   }
 
   async waitForAuthorizationCode() {
@@ -830,6 +895,21 @@ class BridgeOAuthProvider {
     await this.writeSession(session);
   }
 
+  async recoverStaleClient(reason) {
+    if (this.staleClientRecoveryUsed) {
+      return false;
+    }
+
+    this.staleClientRecoveryUsed = true;
+    await this.invalidateCredentials("all");
+    log("info", "cleared stale OAuth client cache; restarting authorization", { reason });
+    return true;
+  }
+
+  async clearSession() {
+    await this.invalidateCredentials("all");
+  }
+
   async readStore() {
     try {
       const raw = await readFile(this.config.oauth.storagePath, "utf8");
@@ -854,7 +934,13 @@ class BridgeOAuthProvider {
   async readSession() {
     const store = await this.readStore();
     const session = store.sessions[this.sessionKey];
-    return session && typeof session === "object" && !Array.isArray(session) ? session : {};
+    if (!session || typeof session !== "object" || Array.isArray(session)) {
+      return {};
+    }
+    if (session.version !== OAUTH_CACHE_SESSION_VERSION || session.fingerprint !== this.sessionFingerprint) {
+      return {};
+    }
+    return session;
   }
 
   async updateSession(patch) {
@@ -866,7 +952,11 @@ class BridgeOAuthProvider {
 
   async writeSession(session) {
     const store = await this.readStore();
-    store.sessions[this.sessionKey] = session;
+    store.sessions[this.sessionKey] = {
+      ...session,
+      fingerprint: this.sessionFingerprint,
+      version: OAUTH_CACHE_SESSION_VERSION
+    };
     store.updatedAt = new Date().toISOString();
     await writeJsonPrivate(this.config.oauth.storagePath, store);
   }
@@ -878,6 +968,26 @@ function createOAuthSessionKey(endpointUrl, redirectUrl) {
     .update("\0")
     .update(redirectUrl.toString())
     .digest("base64url");
+}
+
+function createOAuthSessionFingerprint(endpointUrl, redirectUrl, scope) {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      endpointUrl: endpointUrl.toString(),
+      redirectUrl: redirectUrl.toString(),
+      scope: scope ?? "",
+      version: OAUTH_CACHE_SESSION_VERSION
+    }))
+    .digest("base64url");
+}
+
+function clientRegistrationExpired(clientInformation) {
+  if (!clientInformation || typeof clientInformation !== "object") {
+    return false;
+  }
+
+  const expiresAt = Number(clientInformation.client_secret_expires_at);
+  return Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= Math.floor(Date.now() / 1000);
 }
 
 async function writeJsonPrivate(path, value) {
@@ -936,7 +1046,7 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
     if (error) {
       response.writeHead(400, { "content-type": "text/html; charset=utf-8" });
       response.end(oauthHtml("Authorization failed", "Claude Desktop can be reopened after retrying the login."));
-      finish(new Error(`OAuth authorization failed: ${error}`));
+      finish(new OAuthAuthorizationError(error, requestUrl.searchParams.get("error_description") ?? undefined));
       return;
     }
 
@@ -965,6 +1075,7 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
 
   return {
     codePromise,
+    port: server.address().port,
     close: () => new Promise((resolveClose) => {
       server.close(() => resolveClose());
     })
@@ -1188,6 +1299,7 @@ async function startBridge(config) {
   ]);
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = config.oauth ? new BridgeOAuthProvider(config) : undefined;
+  await clearOAuthSessionIfRequested(config, oauthProvider);
 
   stdioTransport = new StdioServerTransport(process.stdin, process.stdout, {
     maxBufferSize: config.maxBufferSize
@@ -1238,6 +1350,25 @@ async function forwardMessage(direction, targetTransport, message) {
   try {
     await targetTransport.send(message);
   } catch (error) {
+    if (direction === "stdio->http" && oauthProvider && isStaleOAuthClientError(error, oauthProvider)) {
+      await recoverStaleOAuthClient({
+        config: oauthProvider.config,
+        error,
+        provider: oauthProvider,
+        startAuthorization: beginOAuthAuthorization
+      }).then(async (recovered) => {
+        if (!recovered) {
+          throw error;
+        }
+        await completeOAuthAndRetry(targetTransport, message);
+      }).catch(async (authError) => {
+        log("error", "OAuth stale-client recovery failed", errorMetadata(authError));
+        await invalidateOAuthSession(oauthProvider, "OAuth stale-client recovery failed");
+        await requestShutdown(1, "OAuth stale-client recovery failed");
+      });
+      return;
+    }
+
     if (direction === "stdio->http" && oauthProvider && isUnauthorizedError(error)) {
       await completeOAuthAndRetry(targetTransport, message).catch(async (authError) => {
         log("error", "OAuth authorization failed", errorMetadata(authError));
@@ -1257,17 +1388,71 @@ function isUnauthorizedError(error) {
 }
 
 async function completeOAuthAndRetry(targetTransport, message) {
-  log("info", "waiting for OAuth browser authorization");
-  const authorizationCode = await oauthProvider.waitForAuthorizationCode().catch(async (error) => {
-    await invalidateOAuthSession(oauthProvider, "OAuth browser authorization failed");
-    throw error;
-  });
-  await targetTransport.finishAuth(authorizationCode).catch(async (error) => {
-    await invalidateOAuthSession(oauthProvider, "OAuth token exchange failed");
-    throw error;
+  await completeOAuthAuthorization({
+    config: oauthProvider.config,
+    provider: oauthProvider,
+    finishAuthorization: async (authorizationCode) => {
+      await targetTransport.finishAuth(authorizationCode);
+    }
   });
   log("info", "OAuth authorization complete; retrying MCP request");
   await targetTransport.send(message);
+}
+
+async function completeOAuthAuthorization({ config, provider, finishAuthorization, startAuthorization = beginOAuthAuthorization }) {
+  while (true) {
+    log("info", "waiting for OAuth browser authorization");
+    try {
+      const authorizationCode = await provider.waitForAuthorizationCode();
+      await finishAuthorization(authorizationCode);
+      return;
+    } catch (error) {
+      if (await recoverStaleOAuthClient({ config, error, provider, startAuthorization })) {
+        continue;
+      }
+      await invalidateOAuthSession(provider, "OAuth authorization failed");
+      throw error;
+    }
+  }
+}
+
+async function recoverStaleOAuthClient({ config, error, provider, startAuthorization }) {
+  if (!isStaleOAuthClientError(error, provider)) {
+    return false;
+  }
+
+  const recovered = await provider.recoverStaleClient(error.oauthError ?? error.message);
+  if (!recovered) {
+    log("error", "OAuth stale-client recovery was already attempted; refusing to retry again", errorMetadata(error));
+    return false;
+  }
+
+  await startAuthorization(provider, config);
+  return true;
+}
+
+function isStaleOAuthClientError(error, provider) {
+  if (error?.oauthError && STALE_CLIENT_OAUTH_ERRORS.has(error.oauthError)) {
+    return true;
+  }
+
+  // The SDK clears an invalid client during token exchange, then reports this
+  // follow-up error because the original authorization code belongs to the old
+  // client. Treat it as the same bounded recovery case.
+  return error instanceof Error
+    && error.message === "Existing OAuth client information is required when exchanging an authorization code"
+    && provider.staleClientRecoveryUsed === false;
+}
+
+async function beginOAuthAuthorization(provider, config) {
+  const { auth } = await import("@modelcontextprotocol/sdk/client/auth.js");
+  const result = await auth(provider, {
+    serverUrl: config.url,
+    fetchFn: makeBridgeFetch(config, 30000)
+  });
+  if (result !== "REDIRECT") {
+    throw new Error(`Expected OAuth authorization redirect after clearing stale client, got ${result}.`);
+  }
 }
 
 async function invalidateOAuthSession(provider, reason) {
@@ -1279,6 +1464,17 @@ async function invalidateOAuthSession(provider, reason) {
     log("info", "cleared OAuth cache for current session", { reason });
   }).catch((error) => {
     log("error", "failed to clear OAuth cache for current session", errorMetadata(error));
+  });
+}
+
+async function clearOAuthSessionIfRequested(config, provider) {
+  if (!config.oauth?.clearCache || !provider) {
+    return;
+  }
+
+  await provider.clearSession();
+  log("info", "cleared OAuth cache for current session by request", {
+    storagePath: config.oauth.storagePath
   });
 }
 
@@ -1373,6 +1569,7 @@ async function runOAuthLogin(config) {
 
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = new BridgeOAuthProvider(config);
+  await clearOAuthSessionIfRequested(config, oauthProvider);
   const fetchFn = makeBridgeFetch(config, 30000);
 
   log("info", "starting OAuth login", {
@@ -1382,27 +1579,37 @@ async function runOAuthLogin(config) {
     timeoutMs: config.timeoutMs ?? 30000
   });
 
-  const result = await auth(oauthProvider, {
-    serverUrl: config.url,
-    fetchFn
-  }).catch(async (error) => {
-    await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
-    throw error;
-  });
+  let result;
+  try {
+    result = await auth(oauthProvider, {
+      serverUrl: config.url,
+      fetchFn
+    });
+  } catch (error) {
+    const recovered = await recoverStaleOAuthClient({
+      config,
+      error,
+      provider: oauthProvider,
+      startAuthorization: beginOAuthAuthorization
+    });
+    if (!recovered) {
+      await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
+      throw error;
+    }
+    result = "REDIRECT";
+  }
 
   if (result === "REDIRECT") {
-    log("info", "waiting for OAuth browser authorization");
-    const authorizationCode = await oauthProvider.waitForAuthorizationCode().catch(async (error) => {
-      await invalidateOAuthSession(oauthProvider, "OAuth browser authorization failed");
-      throw error;
-    });
-    await auth(oauthProvider, {
-      serverUrl: config.url,
-      authorizationCode,
-      fetchFn
-    }).catch(async (error) => {
-      await invalidateOAuthSession(oauthProvider, "OAuth token exchange failed");
-      throw error;
+    await completeOAuthAuthorization({
+      config,
+      provider: oauthProvider,
+      finishAuthorization: async (authorizationCode) => {
+        await auth(oauthProvider, {
+          serverUrl: config.url,
+          authorizationCode,
+          fetchFn
+        });
+      }
     });
   }
 
@@ -1444,15 +1651,25 @@ async function connectOAuthClient({ Client, StreamableHTTPClientTransport, confi
     ]).catch(() => undefined);
     await client.close();
   } catch (error) {
-    if (isUnauthorizedError(error)) {
-      log("info", "waiting for OAuth browser authorization");
-      const authorizationCode = await provider.waitForAuthorizationCode().catch(async (authError) => {
-        await invalidateOAuthSession(provider, "OAuth browser authorization failed");
-        throw authError;
-      });
-      await transport.finishAuth(authorizationCode).catch(async (authError) => {
-        await invalidateOAuthSession(provider, "OAuth token exchange failed");
-        throw authError;
+    if (isUnauthorizedError(error) || isStaleOAuthClientError(error, provider)) {
+      if (isStaleOAuthClientError(error, provider)) {
+        const recovered = await recoverStaleOAuthClient({
+          config,
+          error,
+          provider,
+          startAuthorization: beginOAuthAuthorization
+        });
+        if (!recovered) {
+          await transport.close().catch(() => undefined);
+          throw error;
+        }
+      }
+      await completeOAuthAuthorization({
+        config,
+        provider,
+        finishAuthorization: async (authorizationCode) => {
+          await transport.finishAuth(authorizationCode);
+        }
       });
       await transport.close().catch(() => undefined);
       log("info", "OAuth authorization complete; verifying cached credentials");
@@ -1498,4 +1715,13 @@ async function main() {
   }
 }
 
-await main();
+if (process.env.MCP_BRIDGE_TEST_MODE !== "1") {
+  await main();
+}
+
+export {
+  BridgeOAuthProvider,
+  OAuthAuthorizationError,
+  completeOAuthAuthorization,
+  createOAuthCallbackWaiter
+};
