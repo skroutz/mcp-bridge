@@ -20,7 +20,7 @@ The bridge intentionally uses only the official `@modelcontextprotocol/sdk` runt
 From a public GitHub repository tag:
 
 ```bash
-npx -y github:skroutz/mcp-bridge#v0.1.0 --url https://mcp.example.com/mcp
+npx -y github:skroutz/mcp-bridge#v0.1.10 --url https://mcp.example.com/mcp
 ```
 
 After publishing to npm:
@@ -62,7 +62,7 @@ GitHub-backed `npx` configuration:
       "command": "npx",
       "args": [
         "-y",
-        "github:skroutz/mcp-bridge#v0.1.0"
+        "github:skroutz/mcp-bridge#v0.1.10"
       ],
       "env": {
         "MCP_BRIDGE_URL": "https://mcp.example.com/mcp",
@@ -154,7 +154,7 @@ unzip -l dist/skroutz-mcp-bridge-$(node -p "require('./package.json').version").
 To debug the exact MCPB launch path from Terminal, run the emulator against either a `.mcpb` file or Claude's already-unpacked extension directory:
 
 ```bash
-npm run emulate:mcpb -- --mcpb dist/skroutz-mcp-bridge-0.1.0.mcpb --clean-env
+npm run emulate:mcpb -- --mcpb dist/skroutz-mcp-bridge-0.1.10.mcpb --clean-env
 ```
 
 ```bash

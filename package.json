@@ -1,6 +1,6 @@
 {
   "name": "mcp-bridge",
-  "version": "0.1.0",
+  "version": "0.1.10",
   "description": "Secure stdio-to-Streamable-HTTP MCP bridge for Claude Desktop.",
   "type": "module",
   "bin": {
