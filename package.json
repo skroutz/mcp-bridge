@@ -19,10 +19,11 @@
   },
   "scripts": {
     "build:mcpb": "node ./scripts/build-mcpb.mjs",
-    "check": "node --check index.js && node --check scripts/build-mcpb.mjs && node --check scripts/check-stdio-runtime.mjs && node --check scripts/emulate-mcpb.mjs && node scripts/check-stdio-runtime.mjs",
+    "check": "node --check index.js && node --check scripts/build-mcpb.mjs && node --check scripts/check-stdio-runtime.mjs && node --check scripts/emulate-mcpb.mjs && node scripts/check-stdio-runtime.mjs && node --test",
     "emulate:mcpb": "node ./scripts/emulate-mcpb.mjs",
     "pack:dry-run": "npm --cache .npm-cache pack --dry-run",
-    "start": "node ./index.js"
+    "start": "node ./index.js",
+    "test": "node --test"
   },
   "keywords": [
     "mcp",

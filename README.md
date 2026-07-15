@@ -142,6 +142,8 @@ When `MCPB_CA_BUNDLE` is set, the build copies the PEM to `certs/ca-bundle.pem` 
 
 For Claude.ai organization settings, upload the generated `.mcpb` as a local MCP extension. Users should then see the configured local MCP server in Claude Desktop without pasting JSON. On first use, the bridge will start the remote OAuth flow and cache the resulting client registration and tokens in the user's OS config directory.
 
+If a remote authorization server invalidates a previously registered DCR client, the bridge clears that endpoint's cached session and starts one fresh DCR/browser authorization cycle automatically. Before opening a browser, it preflights the authorization URL so an authorization-endpoint HTTP 400 containing `invalid_client` also triggers this recovery. The retry is deliberately limited to one per bridge start to avoid loops or registration rate limits.
+
 Before uploading a new MCPB release:
 
 ```bash
@@ -182,6 +184,14 @@ The bridge will:
 - Open the system browser for interactive login.
 - Receive the authorization callback on `http://127.0.0.1:33418/oauth/callback`.
 - Store OAuth client information and tokens in the user config directory.
+
+The default OAuth cache locations are:
+
+- macOS: `~/Library/Application Support/mcp-bridge/oauth-cache.json`
+- Linux: `$XDG_CONFIG_HOME/mcp-bridge/oauth-cache.json`, or `~/.config/mcp-bridge/oauth-cache.json`
+- Windows: `%APPDATA%\mcp-bridge\oauth-cache.json`
+
+Use `--oauth-clear-cache` (or `MCP_BRIDGE_OAUTH_CLEAR_CACHE=true`) to clear only the session matching the current remote URL, callback URL, and OAuth scope before continuing. Use `--oauth-storage` when an administrator needs to place the cache elsewhere.
 
 After login completes, restart Claude Desktop with `MCP_BRIDGE_OAUTH=true` in the server config.
 
@@ -254,6 +264,7 @@ Environment variables:
 | `MCP_BRIDGE_CONFIG` | Optional JSON config file path. Supports `~` and relative paths. |
 | `MCP_BRIDGE_OAUTH` | Set to `true` to enable OAuth 2.1/DCR browser login for the remote endpoint. |
 | `MCP_BRIDGE_OAUTH_LOGIN` | Set to `true` to run login only, cache credentials, then exit. Equivalent to `--oauth-login`. |
+| `MCP_BRIDGE_OAUTH_CLEAR_CACHE` | Set to `true` to clear the current OAuth session before continuing. Equivalent to `--oauth-clear-cache`. |
 | `MCP_BRIDGE_OAUTH_CALLBACK_PORT` | Optional loopback callback port. Default: `33418`. |
 | `MCP_BRIDGE_OAUTH_STORAGE` | Optional OAuth cache file path. Defaults to the user config directory. |
 | `MCP_BRIDGE_OAUTH_SCOPE` | Optional OAuth scope override. |
@@ -284,6 +295,7 @@ Config file:
     "X-Tenant": "tenant-a"
   },
   "oauth": false,
+  "oauthClearCache": false,
   "oauthCallbackPort": 33418,
   "oauthOpenBrowser": true,
   "caBundle": "/absolute/path/to/company-ca.pem",
