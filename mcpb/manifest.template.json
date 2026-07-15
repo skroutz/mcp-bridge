@@ -44,7 +44,8 @@
   "compatibility": {
     "platforms": [
       "darwin",
-      "win32"
+      "win32",
+      "linux"
     ],
     "runtimes": {
       "node": ">=24.0.0"

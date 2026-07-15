@@ -10,8 +10,9 @@ The bridge intentionally uses only the official `@modelcontextprotocol/sdk` runt
 
 ## Requirements
 
-- Node.js 24 or newer on macOS or Windows.
+- Node.js 24 or newer on macOS, Windows, or Linux.
 - A reachable Streamable-HTTP MCP endpoint, for example `https://mcp.example.com/mcp`.
+- On Linux, a URL opener for OAuth browser login. The bridge honors the `BROWSER` environment variable and otherwise tries common openers in order.
 - Optional OAuth 2.1/DCR browser login, bearer token, API key, or static headers required by your firewalled endpoint.
 
 ## Run With npx
@@ -44,6 +45,12 @@ Windows path:
 
 ```text
 %APPDATA%\Claude\claude_desktop_config.json
+```
+
+Linux path:
+
+```text
+~/.config/Claude/claude_desktop_config.json
 ```
 
 GitHub-backed `npx` configuration:
@@ -354,7 +361,7 @@ MCP_BRIDGE_ALLOW_HTTP=true MCP_BRIDGE_URL=http://127.0.0.1:3000/mcp npm start
 
 6. Upload the `.mcpb` artifact to Claude.ai organization settings for managed local-MCP distribution.
 
-7. Smoke-test the release tag on macOS and Windows:
+7. Smoke-test the release tag on macOS, Windows, and Linux:
 
    ```bash
    npx -y github:skroutz/mcp-bridge#v0.1.1 --help
