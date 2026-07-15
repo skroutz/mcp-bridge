@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
-const inputPath = resolve(root, args.mcpb ?? "dist/skroutz-mcp-bridge-0.1.0.mcpb");
+const inputPath = resolve(root, args.mcpb ?? "dist/skroutz-mcp-bridge-0.1.10.mcpb");
 const timeoutMs = Number(args.timeoutMs ?? 70_000);
 const protocolVersion = args.protocolVersion ?? "2025-11-25";
 const inputStat = await stat(inputPath);
@@ -71,7 +71,7 @@ try {
       },
       clientInfo: {
         name: "claude-ai",
-        version: "0.1.0"
+        version: "0.1.10"
       }
     }
   };
