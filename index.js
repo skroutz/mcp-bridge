@@ -1021,11 +1021,20 @@ function openBrowserLinuxCommands(target) {
 }
 
 async function openBrowserLinux(target) {
+  const env = resolveLinuxOpenerEnv();
+  log("info", "Linux browser launch environment", {
+    display: Boolean(env.DISPLAY),
+    waylandDisplay: Boolean(env.WAYLAND_DISPLAY),
+    dbusSessionBus: Boolean(env.DBUS_SESSION_BUS_ADDRESS),
+    xdgRuntimeDir: Boolean(env.XDG_RUNTIME_DIR),
+    path: Boolean(env.PATH)
+  });
+
   const failures = [];
 
   for (const candidate of openBrowserLinuxCommands(target)) {
     try {
-      await spawnAndWait(candidate.command, candidate.args);
+      await spawnAndWait(candidate.command, candidate.args, { env });
       return candidate.method;
     } catch (error) {
       failures.push(`${candidate.method}: ${error.message}`);
@@ -1033,6 +1042,44 @@ async function openBrowserLinux(target) {
   }
 
   throw new Error(`No Linux URL opener succeeded. Tried: ${failures.join("; ")}`);
+}
+
+function resolveLinuxOpenerEnv() {
+  // Claude Desktop's MCP utility process can start the bridge with an almost
+  // empty environment (only the vars from the manifest's mcp_config.env), so
+  // desktop-session variables normally inherited from a login shell may be
+  // missing here. Fill gaps from well-known Linux conventions without
+  // overriding anything that is already present.
+  const env = { ...process.env };
+
+  if (!env.PATH) {
+    env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  }
+
+  if (!env.HOME) {
+    env.HOME = homedir();
+  }
+
+  if (!env.XDG_RUNTIME_DIR && typeof process.getuid === "function") {
+    const candidate = `/run/user/${process.getuid()}`;
+    if (existsSync(candidate)) {
+      env.XDG_RUNTIME_DIR = candidate;
+    }
+  }
+
+  if (!env.DISPLAY && existsSync("/tmp/.X11-unix/X0")) {
+    env.DISPLAY = ":0";
+  }
+
+  if (!env.WAYLAND_DISPLAY && env.XDG_RUNTIME_DIR && existsSync(join(env.XDG_RUNTIME_DIR, "wayland-0"))) {
+    env.WAYLAND_DISPLAY = "wayland-0";
+  }
+
+  if (!env.DBUS_SESSION_BUS_ADDRESS && env.XDG_RUNTIME_DIR && existsSync(join(env.XDG_RUNTIME_DIR, "bus"))) {
+    env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${join(env.XDG_RUNTIME_DIR, "bus")}`;
+  }
+
+  return env;
 }
 
 async function openBrowserWindows(target) {
@@ -1076,17 +1123,56 @@ async function openBrowserWindows(target) {
   throw new Error(failures.join("; "));
 }
 
-function spawnAndWait(command, args) {
+function spawnAndWait(command, args, { env, waitForExitMs = 4000 } = {}) {
   return new Promise((resolveSpawn, rejectSpawn) => {
     const child = spawn(command, args, {
       detached: true,
-      stdio: "ignore"
+      env: env ?? process.env,
+      stdio: ["ignore", "pipe", "pipe"]
     });
-    child.once("error", rejectSpawn);
-    child.once("spawn", () => {
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const settle = (result, error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(graceTimer);
       child.unref();
-      resolveSpawn();
+      if (error) {
+        rejectSpawn(error);
+      } else {
+        resolveSpawn(result);
+      }
+    };
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
     });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.once("error", (error) => settle(undefined, error));
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        settle({ code });
+        return;
+      }
+      const detail = stderr.trim() || stdout.trim() || "no output";
+      settle(undefined, new Error(`exited with code ${code ?? "null"}${signal ? ` (signal ${signal})` : ""}: ${detail}`));
+    });
+
+    // Some openers exec into a long-lived browser process instead of exiting
+    // quickly. Treat "still running after a grace period" as success rather
+    // than waiting indefinitely.
+    const graceTimer = setTimeout(() => {
+      settle({ stillRunning: true });
+    }, waitForExitMs);
+    graceTimer.unref?.();
   });
 }
 
