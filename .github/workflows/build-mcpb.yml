@@ -1,0 +1,109 @@
+name: Build MCPB
+
+on:
+  workflow_dispatch:
+    inputs:
+      mcpb_name:
+        description: "MCPB name"
+        required: true
+      mcpb_display_name:
+        description: "Display name"
+        required: true
+      version:
+        description: "MCPB version"
+        required: true
+      remote_mcp_url:
+        description: "Remote Streamable-HTTP MCP endpoint URL"
+        required: true
+      privacy_policies:
+        description: "Privacy policy URL"
+        required: true
+      ca_bundle_url:
+        description: "URL to fetch an optional PEM CA bundle to embed. Leave blank to skip"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Download CA bundle
+        if: ${{ inputs.ca_bundle_url != '' }}
+        env:
+          CA_BUNDLE_URL: ${{ inputs.ca_bundle_url }}
+          CA_BUNDLE_PATH: ${{ runner.temp }}/ca-bundle.pem
+        run: |
+          set -euo pipefail
+
+          case "$CA_BUNDLE_URL" in
+            https://*) ;;
+            *)
+              echo "::error::ca_bundle_url must use https://. Got: $CA_BUNDLE_URL" >&2
+              exit 1
+              ;;
+          esac
+
+          curl -fsSL "$CA_BUNDLE_URL" -o "$CA_BUNDLE_PATH"
+
+          if grep -q -- "-----BEGIN.*PRIVATE KEY-----" "$CA_BUNDLE_PATH"; then
+            echo "::error::Downloaded CA bundle appears to contain a private key. It must be a public CA certificate only; refusing to embed it." >&2
+            exit 1
+          fi
+
+          split_dir="$RUNNER_TEMP/ca-bundle-certs"
+          mkdir -p "$split_dir"
+          awk -v dir="$split_dir" '
+            /-----BEGIN CERTIFICATE-----/ { n++; file = dir "/cert-" n ".pem" }
+            n > 0 { print > file }
+            /-----END CERTIFICATE-----/ { if (n > 0) close(file) }
+          ' "$CA_BUNDLE_PATH"
+
+          cert_files=("$split_dir"/cert-*.pem)
+          if [ ! -e "${cert_files[0]}" ]; then
+            echo "::error::Downloaded CA bundle does not contain any PEM certificates." >&2
+            exit 1
+          fi
+
+          for cert_file in "${cert_files[@]}"; do
+            if ! openssl x509 -in "$cert_file" -noout -subject >/dev/null 2>&1; then
+              echo "::error::One of the entries in the downloaded CA bundle is not a valid X.509 certificate." >&2
+              exit 1
+            fi
+          done
+
+      - name: Build MCPB
+        env:
+          MCPB_NAME: ${{ inputs.mcpb_name }}
+          MCPB_DISPLAY_NAME: ${{ inputs.mcpb_display_name }}
+          MCPB_VERSION: ${{ inputs.version }}
+          MCPB_REMOTE_MCP_URL: ${{ inputs.remote_mcp_url }}
+          MCPB_PRIVACY_POLICIES: ${{ inputs.privacy_policies }}
+          CA_BUNDLE_URL: ${{ inputs.ca_bundle_url }}
+          CA_BUNDLE_PATH: ${{ runner.temp }}/ca-bundle.pem
+        run: |
+          set -euo pipefail
+          if [ -n "$CA_BUNDLE_URL" ]; then
+            export MCPB_CA_BUNDLE="$CA_BUNDLE_PATH"
+          fi
+          npm run build:mcpb
+
+      - name: Upload MCPB artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.mcpb_name }}-mcpb
+          path: dist/*.mcpb
+          retention-days: 3
+          if-no-files-found: error

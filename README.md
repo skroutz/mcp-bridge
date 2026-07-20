@@ -8,6 +8,21 @@ Claude Desktop <-> local stdio <-> mcp-bridge <-> HTTPS Streamable HTTP <-> remo
 
 The bridge intentionally uses only the official `@modelcontextprotocol/sdk` runtime transports for MCP framing, Streamable-HTTP behavior, and OAuth client flows. The local code validates configuration, attaches authentication headers when configured, handles OAuth browser login when enabled, forwards JSON-RPC messages, and cleans up remote sessions on termination.
 
+## Build MCPB Files With GitHub Actions
+
+The [`Build MCPB`](.github/workflows/build-mcpb.yml) workflow builds an organization-specific `.mcpb` bundle without needing a local Node.js environment. Trigger it manually from the Actions tab (or `gh workflow run build-mcpb.yml -f ...`) with these inputs:
+
+| Input | Required | Description |
+| --- | --- | --- |
+| `mcpb_name` | Yes | Extension name (manifest `name`, used in the bundle filename). |
+| `mcpb_display_name` | Yes | Human-readable display name. |
+| `version` | Yes | MCPB version to embed in the manifest and filename. |
+| `remote_mcp_url` | Yes | Remote Streamable-HTTP MCP endpoint URL. |
+| `privacy_policies` | Yes | Privacy policy URL to embed in the manifest. |
+| `ca_bundle_url` | No | URL to fetch an optional PEM CA bundle to embed. Leave blank to build without one. |
+
+The workflow installs production dependencies, optionally downloads the CA bundle over HTTPS, and runs `npm run build:mcpb`. The resulting `.mcpb` is uploaded as a workflow artifact named `<mcpb_name>-mcpb`, retained for specific days.
+
 ## Requirements
 
 - Node.js 24 or newer on macOS, Windows, or Linux.
@@ -20,7 +35,7 @@ The bridge intentionally uses only the official `@modelcontextprotocol/sdk` runt
 From a public GitHub repository tag:
 
 ```bash
-npx -y github:skroutz/mcp-bridge#v0.1.12 --url https://mcp.example.com/mcp
+npx -y github:skroutz/mcp-bridge#v0.0.1 --url https://mcp.example.com/mcp
 ```
 
 After publishing to npm:
@@ -62,7 +77,7 @@ GitHub-backed `npx` configuration:
       "command": "npx",
       "args": [
         "-y",
-        "github:skroutz/mcp-bridge#v0.1.12"
+        "github:skroutz/mcp-bridge#v0.0.1"
       ],
       "env": {
         "MCP_BRIDGE_URL": "https://mcp.example.com/mcp",
@@ -156,7 +171,7 @@ unzip -l dist/skroutz-mcp-bridge-$(node -p "require('./package.json').version").
 To debug the exact MCPB launch path from Terminal, run the emulator against either a `.mcpb` file or Claude's already-unpacked extension directory:
 
 ```bash
-npm run emulate:mcpb -- --mcpb dist/skroutz-mcp-bridge-0.1.12.mcpb --clean-env
+npm run emulate:mcpb -- --mcpb dist/skroutz-mcp-bridge-0.0.1.mcpb --clean-env
 ```
 
 ```bash
