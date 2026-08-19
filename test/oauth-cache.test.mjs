@@ -203,6 +203,96 @@ test("concurrent authorization redirects reuse one callback and browser launch",
   });
 });
 
+test("OAuth browser launch waits for bridge process stabilization", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, { status: 302 });
+    const callback = deferred();
+    const stabilizationEntered = deferred();
+    const releaseStabilization = deferred();
+    let browserLaunches = 0;
+    const provider = new BridgeOAuthProvider({
+      ...oauthConfig(join(directory, "oauth-cache.json")),
+      oauth: {
+        ...oauthConfig(join(directory, "oauth-cache.json")).oauth,
+        browserLaunchDelayMs: 5_000,
+        browserLaunchStabilizer: async (delayMs) => {
+          assert.equal(delayMs, 5_000);
+          stabilizationEntered.resolve();
+          await releaseStabilization.promise;
+        },
+        browserOpener: async () => {
+          browserLaunches += 1;
+          return "test-browser";
+        },
+        callbackWaiterFactory: async () => ({
+          cancel: callback.reject,
+          close: async () => undefined,
+          codePromise: callback.promise,
+          port: 33418
+        }),
+        openBrowser: true
+      }
+    });
+
+    try {
+      const redirect = provider.redirectToAuthorization(new URL("https://auth.example.test/authorize"));
+      await stabilizationEntered.promise;
+      assert.equal(browserLaunches, 0);
+      releaseStabilization.resolve();
+      await redirect;
+      assert.equal(browserLaunches, 1);
+      await provider.resetAuthorizationFlow();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("OAuth browser launch is cancelled when the probe exits during stabilization", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, { status: 302 });
+    const callback = deferred();
+    const stabilizationEntered = deferred();
+    const releaseStabilization = deferred();
+    let browserLaunches = 0;
+    const provider = new BridgeOAuthProvider({
+      ...oauthConfig(join(directory, "oauth-cache.json")),
+      oauth: {
+        ...oauthConfig(join(directory, "oauth-cache.json")).oauth,
+        browserLaunchDelayMs: 5_000,
+        browserLaunchStabilizer: async () => {
+          stabilizationEntered.resolve();
+          await releaseStabilization.promise;
+        },
+        browserOpener: async () => {
+          browserLaunches += 1;
+          return "test-browser";
+        },
+        callbackWaiterFactory: async () => ({
+          cancel: callback.reject,
+          close: async () => undefined,
+          codePromise: callback.promise,
+          port: 33418
+        }),
+        openBrowser: true
+      }
+    });
+
+    try {
+      const redirect = provider.redirectToAuthorization(new URL("https://auth.example.test/authorize"));
+      await stabilizationEntered.promise;
+      await provider.resetAuthorizationFlow();
+      releaseStabilization.resolve();
+      await redirect;
+      assert.equal(browserLaunches, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test("concurrent authorization completions exchange the code once", async () => {
   const coordinator = new OAuthFlowCoordinator({});
   let exchanges = 0;

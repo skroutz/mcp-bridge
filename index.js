@@ -88,6 +88,7 @@ class OAuthAuthorizationError extends Error {
 }
 
 const OAUTH_CACHE_SESSION_VERSION = 1;
+const OAUTH_BROWSER_STABILIZATION_MS = 5_000;
 const STALE_CLIENT_OAUTH_ERRORS = new Set(["invalid_client", "unauthorized_client"]);
 
 let stdioTransport;
@@ -357,6 +358,7 @@ async function buildConfig(args, env) {
     oauth: oauthEnabled
       ? {
         callbackPort: oauthCallbackPort,
+        browserLaunchDelayMs: oauthLogin ? 0 : OAUTH_BROWSER_STABILIZATION_MS,
         clearCache: oauthClearCache,
         loginOnly: oauthLogin,
         redirectUrl: new URL(`http://127.0.0.1:${oauthCallbackPort}/oauth/callback`),
@@ -837,6 +839,7 @@ class BridgeOAuthProvider {
     this.currentState = undefined;
     this.codeVerifierValue = undefined;
     this.authorizationRedirectPromise = undefined;
+    this.authorizationFlowGeneration = 0;
     this.staleClientRecoveryUsed = false;
   }
 
@@ -1019,8 +1022,14 @@ class BridgeOAuthProvider {
 
   async startAuthorizationRedirect(authorizationUrl) {
     const redirectStartedAt = Date.now();
-    await this.assertAuthorizationClientIsValid(authorizationUrl);
+    if (this.config.oauth.openBrowser) {
+      await this.prepareAuthorizationCallback();
+      if (!await this.waitForBrowserLaunchStability()) {
+        return;
+      }
+    }
 
+    await this.assertAuthorizationClientIsValid(authorizationUrl);
     await this.prepareAuthorizationCallback();
 
     log("info", this.config.oauth.openBrowser
@@ -1047,6 +1056,23 @@ class BridgeOAuthProvider {
       });
       throw error;
     });
+  }
+
+  async waitForBrowserLaunchStability() {
+    const delayMs = this.config.oauth.browserLaunchDelayMs ?? 0;
+    if (delayMs <= 0) {
+      return true;
+    }
+
+    const generation = this.authorizationFlowGeneration;
+    log("info", "delaying OAuth browser launch while bridge process stabilizes", { delayMs });
+    const stabilizer = this.config.oauth.browserLaunchStabilizer ?? delay;
+    await stabilizer(delayMs);
+    if (generation !== this.authorizationFlowGeneration) {
+      log("info", "OAuth browser launch cancelled before stabilization completed");
+      return false;
+    }
+    return true;
   }
 
   async assertAuthorizationClientIsValid(authorizationUrl) {
@@ -1148,6 +1174,7 @@ class BridgeOAuthProvider {
   }
 
   async resetAuthorizationFlow() {
+    this.authorizationFlowGeneration += 1;
     const pendingCallback = this.pendingCallback;
     this.pendingCallback = undefined;
     this.currentState = undefined;

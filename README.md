@@ -200,6 +200,8 @@ The bridge will:
 - Receive the authorization callback on the first available loopback port starting at `33418`.
 - Store OAuth client information and tokens in the user config directory.
 
+When Claude Desktop launches a normal bridge process, browser opening is delayed for five seconds. This allows Claude's short-lived compatibility probe to exit before it can create a stale authorization tab. Explicit `--oauth-login` runs open the browser immediately.
+
 The default OAuth cache locations are:
 
 - macOS: `~/Library/Application Support/mcp-bridge/oauth-cache.json`
