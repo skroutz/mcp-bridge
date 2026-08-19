@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -94,6 +94,7 @@ let stdioTransport;
 let remoteTransport;
 let oauthProvider;
 let oauthFlowCoordinator;
+let initializationBarrier;
 let UnauthorizedErrorCtor;
 let closing = false;
 
@@ -722,13 +723,14 @@ function combineAbortSignals(signals) {
 class OAuthFlowCoordinator {
   constructor(provider) {
     this.provider = provider;
+    this.initialRequestCompleted = false;
     this.initialGateUsers = 0;
     this.initialSendTail = Promise.resolve();
     this.authorizationPromise = undefined;
   }
 
   async runWithInitialAuthGate(operation) {
-    if (this.initialGateUsers === 0 && await this.provider.tokens()) {
+    if (this.initialRequestCompleted) {
       return await operation();
     }
 
@@ -741,9 +743,16 @@ class OAuthFlowCoordinator {
 
     await previous;
     try {
-      return await operation();
+      if (this.initialRequestCompleted) {
+        return await operation();
+      }
+      await this.provider.prepareAuthorization?.();
+      const result = await operation();
+      this.initialRequestCompleted = true;
+      return result;
     } finally {
       this.initialGateUsers -= 1;
+      await this.provider.releaseAuthorizationOwnership?.();
       release();
     }
   }
@@ -768,11 +777,62 @@ class OAuthFlowCoordinator {
   }
 }
 
+class McpInitializationBarrier {
+  constructor() {
+    this.initializationStarted = false;
+    this.initialized = false;
+    this.initialization = deferredPromise();
+    // A failed initialization is also returned to its caller. This handler
+    // prevents a second unhandled rejection when no later MCP message waits.
+    this.initialization.promise.catch(() => undefined);
+  }
+
+  async forward(message, operation) {
+    if (this.initialized) {
+      return await operation();
+    }
+
+    if (isInitializeMessage(message) && !this.initializationStarted) {
+      this.initializationStarted = true;
+      try {
+        const result = await operation();
+        this.initialized = true;
+        this.initialization.resolve();
+        return result;
+      } catch (error) {
+        this.initialization.reject(error);
+        throw error;
+      }
+    }
+
+    await this.initialization.promise;
+    return await operation();
+  }
+}
+
+function isInitializeMessage(message) {
+  const messages = Array.isArray(message) ? message : [message];
+  return messages.some((item) => item?.method === "initialize" && item?.id !== undefined);
+}
+
+function deferredPromise() {
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, reject: rejectPromise, resolve: resolvePromise };
+}
+
 class BridgeOAuthProvider {
   constructor(config) {
     this.config = config;
-    this.sessionKey = createOAuthSessionKey(config.url, config.oauth.redirectUrl);
-    this.sessionFingerprint = createOAuthSessionFingerprint(config.url, config.oauth.redirectUrl, config.oauth.scope);
+    this.configuredRedirectUrl = new URL(config.oauth.redirectUrl);
+    this.sessionKey = createOAuthSessionKey(config.url, this.configuredRedirectUrl);
+    this.sessionFingerprint = createOAuthSessionFingerprint(config.url, this.configuredRedirectUrl, config.oauth.scope);
+    this.authorizationLockPath = `${config.oauth.storagePath}.${this.sessionKey}.authorization.lock`;
+    this.authorizationLock = undefined;
     this.pendingCallback = undefined;
     this.currentState = undefined;
     this.codeVerifierValue = undefined;
@@ -782,6 +842,97 @@ class BridgeOAuthProvider {
 
   get redirectUrl() {
     return this.config.oauth.redirectUrl;
+  }
+
+  async prepareAuthorization() {
+    if (this.authorizationLock) {
+      await this.prepareAuthorizationCallback();
+      return true;
+    }
+
+    const startingTokenFingerprint = tokenFingerprint(await this.tokens());
+    let loggedWaiting = false;
+    while (true) {
+      const lock = await tryAcquireProcessLock(this.authorizationLockPath);
+      if (lock) {
+        const currentTokens = await this.tokens();
+        if (loggedWaiting && currentTokens && tokenFingerprint(currentTokens) !== startingTokenFingerprint) {
+          await lock.release();
+          return false;
+        }
+        this.authorizationLock = lock;
+        await this.prepareAuthorizationCallback();
+        log("info", "acquired OAuth authorization ownership", {
+          callback: this.redirectUrl.toString()
+        });
+        return true;
+      }
+
+      if (!loggedWaiting) {
+        loggedWaiting = true;
+        log("info", "another bridge process owns OAuth authorization; waiting for cached credentials");
+      }
+      await delay(200);
+    }
+  }
+
+  async prepareAuthorizationCallback() {
+    if (this.pendingCallback) {
+      return;
+    }
+
+    const session = await this.readSession();
+    const configuredPort = validCallbackPort(this.config.oauth.callbackPort)
+      ? this.config.oauth.callbackPort
+      : Number(this.configuredRedirectUrl.port);
+    const preferredPort = validCallbackPort(session.callbackPort)
+      ? session.callbackPort
+      : configuredPort;
+    const callbackWaiterFactory = this.config.oauth.callbackWaiterFactory ?? createOAuthCallbackWaiter;
+    const expectedState = await this.state();
+    const callback = await callbackWaiterFactory({
+      expectedPath: this.configuredRedirectUrl.pathname,
+      expectedState,
+      host: this.configuredRedirectUrl.hostname,
+      port: preferredPort,
+      timeoutMs: 10 * 60 * 1000
+    });
+    callback.codePromise.catch(() => undefined);
+    this.pendingCallback = callback;
+    this.config.oauth.redirectUrl = new URL(this.configuredRedirectUrl);
+    this.config.oauth.redirectUrl.port = String(callback.port);
+    await this.mutateSession((currentSession) => {
+      const previousCallbackPort = validCallbackPort(currentSession.callbackPort)
+        ? currentSession.callbackPort
+        : configuredPort;
+      if (previousCallbackPort !== callback.port) {
+        delete currentSession.clientInformation;
+      }
+      currentSession.callbackPort = callback.port;
+      return currentSession;
+    });
+
+    if (callback.port !== preferredPort) {
+      log("info", "OAuth callback port was occupied; selected next available port", {
+        preferredPort,
+        selectedPort: callback.port
+      });
+    }
+  }
+
+  async releaseAuthorizationOwnership() {
+    const lock = this.authorizationLock;
+    this.authorizationLock = undefined;
+    if (!lock) {
+      return;
+    }
+    try {
+      if (this.pendingCallback) {
+        await this.resetAuthorizationFlow();
+      }
+    } finally {
+      await lock.release();
+    }
   }
 
   get clientMetadata() {
@@ -870,16 +1021,7 @@ class BridgeOAuthProvider {
     const redirectStartedAt = Date.now();
     await this.assertAuthorizationClientIsValid(authorizationUrl);
 
-    if (!this.pendingCallback) {
-      const callbackWaiterFactory = this.config.oauth.callbackWaiterFactory ?? createOAuthCallbackWaiter;
-      this.pendingCallback = await callbackWaiterFactory({
-        expectedPath: this.redirectUrl.pathname,
-        expectedState: this.currentState,
-        host: this.redirectUrl.hostname,
-        port: Number(this.redirectUrl.port),
-        timeoutMs: 10 * 60 * 1000
-      });
-    }
+    await this.prepareAuthorizationCallback();
 
     log("info", this.config.oauth.openBrowser
       ? "OAuth authorization required; opening browser"
@@ -972,22 +1114,21 @@ class BridgeOAuthProvider {
   }
 
   async invalidateCredentials(scope) {
-    const session = await this.readSession();
-
-    if (scope === "all" || scope === "client") {
-      delete session.clientInformation;
-    }
-    if (scope === "all" || scope === "tokens") {
-      delete session.tokens;
-    }
     if (scope === "all" || scope === "verifier") {
       this.codeVerifierValue = undefined;
     }
-    if (scope === "all" || scope === "discovery") {
-      delete session.discoveryState;
-    }
-
-    await this.writeSession(session);
+    await this.mutateSession((session) => {
+      if (scope === "all" || scope === "client") {
+        delete session.clientInformation;
+      }
+      if (scope === "all" || scope === "tokens") {
+        delete session.tokens;
+      }
+      if (scope === "all" || scope === "discovery") {
+        delete session.discoveryState;
+      }
+      return session;
+    });
   }
 
   async recoverStaleClient(reason) {
@@ -1050,26 +1191,41 @@ class BridgeOAuthProvider {
   }
 
   async updateSession(patch) {
-    await this.writeSession({
-      ...await this.readSession(),
-      ...patch
-    });
+    await this.mutateSession((session) => ({ ...session, ...patch }));
   }
 
-  async writeSession(session) {
-    const store = await this.readStore();
-    store.sessions[this.sessionKey] = {
-      ...session,
-      fingerprint: this.sessionFingerprint,
-      version: OAUTH_CACHE_SESSION_VERSION
-    };
-    store.updatedAt = new Date().toISOString();
-    await writeJsonPrivate(this.config.oauth.storagePath, store);
+  async mutateSession(mutation) {
+    const cacheLock = await acquireProcessLock(`${this.config.oauth.storagePath}.write.lock`);
+    try {
+      const store = await this.readStore();
+      const storedSession = store.sessions[this.sessionKey];
+      const currentSession = storedSession
+        && typeof storedSession === "object"
+        && !Array.isArray(storedSession)
+        && storedSession.version === OAUTH_CACHE_SESSION_VERSION
+        && storedSession.fingerprint === this.sessionFingerprint
+        ? storedSession
+        : {};
+      const session = mutation({ ...currentSession });
+      store.sessions[this.sessionKey] = {
+        ...session,
+        fingerprint: this.sessionFingerprint,
+        version: OAUTH_CACHE_SESSION_VERSION
+      };
+      store.updatedAt = new Date().toISOString();
+      await writeJsonPrivate(this.config.oauth.storagePath, store);
+    } finally {
+      await cacheLock.release();
+    }
   }
 }
 
 function createPkceCodeChallenge(codeVerifier) {
   return createHash("sha256").update(codeVerifier).digest("base64url");
+}
+
+function tokenFingerprint(tokens) {
+  return createHash("sha256").update(JSON.stringify(tokens ?? null)).digest("base64url");
 }
 
 function createOAuthSessionKey(endpointUrl, redirectUrl) {
@@ -1107,17 +1263,97 @@ async function writeJsonPrivate(path, value) {
   await rename(tempPath, path);
 }
 
+function validCallbackPort(value) {
+  return Number.isInteger(value) && value >= 1024 && value <= 65535;
+}
+
+async function acquireProcessLock(path) {
+  while (true) {
+    const lock = await tryAcquireProcessLock(path);
+    if (lock) {
+      return lock;
+    }
+    await delay(50);
+  }
+}
+
+async function tryAcquireProcessLock(path) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  let handle;
+  try {
+    handle = await open(path, "wx", 0o600);
+    await handle.writeFile(JSON.stringify({ createdAt: new Date().toISOString(), pid: process.pid }));
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error.code !== "EEXIST") {
+      throw error;
+    }
+    if (await removeStaleProcessLock(path)) {
+      return await tryAcquireProcessLock(path);
+    }
+    return undefined;
+  }
+
+  let released = false;
+  return {
+    async release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      await handle.close();
+      await unlink(path).catch((error) => {
+        if (error.code !== "ENOENT") {
+          throw error;
+        }
+      });
+    }
+  };
+}
+
+async function removeStaleProcessLock(path) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return true;
+    }
+    const lockStat = await stat(path).catch(() => undefined);
+    if (!lockStat || Date.now() - lockStat.mtimeMs < 5_000) {
+      return false;
+    }
+  }
+
+  const pid = Number(owner?.pid);
+  if (Number.isInteger(pid) && pid > 0 && processIsRunning(pid)) {
+    return false;
+  }
+
+  const stalePath = `${path}.stale.${process.pid}.${randomBytes(6).toString("hex")}`;
+  try {
+    await rename(path, stalePath);
+    await unlink(stalePath);
+    return true;
+  } catch (error) {
+    return error.code === "ENOENT";
+  }
+}
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
 async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, port, timeoutMs }) {
   let server;
   let settled = false;
-  let readyResolve;
-  let readyReject;
   let codeResolve;
   let codeReject;
-  const readyPromise = new Promise((resolveReady, rejectReady) => {
-    readyResolve = resolveReady;
-    readyReject = rejectReady;
-  });
   const codePromise = new Promise((resolveCode, rejectCode) => {
     codeResolve = resolveCode;
     codeReject = rejectCode;
@@ -1178,9 +1414,15 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
     finish(undefined, code);
   });
 
-  server.on("error", readyReject);
-  server.listen(port, host, readyResolve);
-  await readyPromise;
+  try {
+    await listenOnAvailableCallbackPort(server, host, port);
+  } catch (error) {
+    clearTimeout(timeout);
+    codePromise.catch(() => undefined);
+    await new Promise((resolveClose) => server.close(() => resolveClose())).catch(() => undefined);
+    throw error;
+  }
+  server.on("error", (error) => finish(error));
 
   return {
     codePromise,
@@ -1190,6 +1432,41 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
       server.close(() => resolveClose());
     })
   };
+}
+
+async function listenOnAvailableCallbackPort(server, host, startingPort) {
+  if (startingPort === 0) {
+    await listenOnce(server, host, 0);
+    return;
+  }
+
+  for (let port = startingPort; port <= 65535; port += 1) {
+    try {
+      await listenOnce(server, host, port);
+      return;
+    } catch (error) {
+      if (error.code !== "EADDRINUSE") {
+        throw error;
+      }
+    }
+  }
+  throw new Error(`No OAuth callback port is available at or above ${startingPort}.`);
+}
+
+function listenOnce(server, host, port) {
+  return new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
 }
 
 function oauthHtml(title, message) {
@@ -1410,6 +1687,7 @@ async function startBridge(config) {
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = config.oauth ? new BridgeOAuthProvider(config) : undefined;
   oauthFlowCoordinator = oauthProvider ? new OAuthFlowCoordinator(oauthProvider) : undefined;
+  initializationBarrier = new McpInitializationBarrier();
   await clearOAuthSessionIfRequested(config, oauthProvider);
 
   stdioTransport = new StdioServerTransport(process.stdin, process.stdout, {
@@ -1458,8 +1736,14 @@ async function forwardMessage(direction, targetTransport, message) {
     return;
   }
 
-  if (direction === "stdio->http" && oauthFlowCoordinator) {
-    await oauthFlowCoordinator.runWithInitialAuthGate(async () => {
+  if (direction === "stdio->http") {
+    await initializationBarrier.forward(message, async () => {
+      if (oauthFlowCoordinator) {
+        await oauthFlowCoordinator.runWithInitialAuthGate(async () => {
+          await forwardMessageAttempt(direction, targetTransport, message);
+        });
+        return;
+      }
       await forwardMessageAttempt(direction, targetTransport, message);
     });
     return;
@@ -1590,6 +1874,7 @@ function isStaleOAuthClientError(error, provider) {
 }
 
 async function beginOAuthAuthorization(provider, config) {
+  await provider.prepareAuthorization();
   const { auth } = await import("@modelcontextprotocol/sdk/client/auth.js");
   const result = await auth(provider, {
     serverUrl: config.url,
@@ -1683,6 +1968,9 @@ async function closeTransports() {
   await oauthProvider?.resetAuthorizationFlow?.().catch((error) => {
     log("error", "failed to cancel active OAuth authorization", errorMetadata(error));
   });
+  await oauthProvider?.releaseAuthorizationOwnership?.().catch((error) => {
+    log("error", "failed to release OAuth authorization ownership", errorMetadata(error));
+  });
 
   if (remoteTransport?.terminateSession) {
     await Promise.race([
@@ -1730,45 +2018,50 @@ async function runOAuthLogin(config) {
 
   let result;
   try {
-    result = await auth(oauthProvider, {
-      serverUrl: config.url,
-      fetchFn
-    });
-  } catch (error) {
-    const recovered = await recoverStaleOAuthClient({
-      config,
-      error,
-      provider: oauthProvider,
-      startAuthorization: beginOAuthAuthorization
-    });
-    if (!recovered) {
-      await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
-      throw error;
-    }
-    result = "REDIRECT";
-  }
-
-  if (result === "REDIRECT") {
-    await completeOAuthAuthorization({
-      config,
-      provider: oauthProvider,
-      finishAuthorization: async (authorizationCode) => {
-        await auth(oauthProvider, {
-          serverUrl: config.url,
-          authorizationCode,
-          fetchFn
-        });
+    try {
+      await oauthProvider.prepareAuthorization();
+      result = await auth(oauthProvider, {
+        serverUrl: config.url,
+        fetchFn
+      });
+    } catch (error) {
+      const recovered = await recoverStaleOAuthClient({
+        config,
+        error,
+        provider: oauthProvider,
+        startAuthorization: beginOAuthAuthorization
+      });
+      if (!recovered) {
+        await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
+        throw error;
       }
-    });
-  }
+      result = "REDIRECT";
+    }
 
-  await connectOAuthClient({
-    Client,
-    StreamableHTTPClientTransport,
-    config,
-    fetchFn,
-    provider: oauthProvider
-  });
+    if (result === "REDIRECT") {
+      await completeOAuthAuthorization({
+        config,
+        provider: oauthProvider,
+        finishAuthorization: async (authorizationCode) => {
+          await auth(oauthProvider, {
+            serverUrl: config.url,
+            authorizationCode,
+            fetchFn
+          });
+        }
+      });
+    }
+
+    await connectOAuthClient({
+      Client,
+      StreamableHTTPClientTransport,
+      config,
+      fetchFn,
+      provider: oauthProvider
+    });
+  } finally {
+    await oauthProvider.releaseAuthorizationOwnership();
+  }
 
   log("info", "OAuth login complete", {
     endpoint: safeUrlForLog(config.url),
@@ -1870,6 +2163,7 @@ if (process.env.MCP_BRIDGE_TEST_MODE !== "1") {
 
 export {
   BridgeOAuthProvider,
+  McpInitializationBarrier,
   OAuthAuthorizationError,
   OAuthFlowCoordinator,
   completeOAuthAuthorization,

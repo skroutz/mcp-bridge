@@ -197,7 +197,7 @@ The bridge will:
 - Discover OAuth metadata from the remote MCP server or protected-resource challenge.
 - Dynamically register a public client when the authorization server supports DCR.
 - Open the system browser for interactive login.
-- Receive the authorization callback on `http://127.0.0.1:33418/oauth/callback`.
+- Receive the authorization callback on the first available loopback port starting at `33418`.
 - Store OAuth client information and tokens in the user config directory.
 
 The default OAuth cache locations are:
@@ -210,7 +210,7 @@ Use `--oauth-clear-cache` (or `MCP_BRIDGE_OAUTH_CLEAR_CACHE=true`) to clear only
 
 After login completes, restart Claude Desktop with `MCP_BRIDGE_OAUTH=true` in the server config.
 
-If the callback port is already in use, set the same explicit port in both the login command and Claude config:
+The configured callback port is the initial start of the search range. The bridge reuses a previously successful port when possible; if the preferred port is occupied, it increments until it can bind a listener, then uses that exact URI for client registration and authorization. To start from a different port, set the same explicit value in both the login command and Claude config:
 
 ```bash
 npx -y github:skroutz/mcp-bridge#main \
@@ -327,6 +327,7 @@ Precedence is config file, then environment variables, then CLI flags.
 - stdout is reserved for MCP messages; logs are written to stderr.
 - Secrets are redacted from bridge logs.
 - OAuth token/client-registration cache files are stored outside the repository in the user config directory with private file permissions where supported by the OS.
+- Concurrent bridge processes coordinate OAuth by remote connector: one process owns browser authorization while sibling processes wait for its cached credentials. Different connectors may authorize simultaneously on different loopback ports.
 - Credentials embedded in endpoint URLs are rejected. Use environment variables or a config file instead.
 - Static bearer/API-key auth and OAuth browser auth are mutually exclusive modes.
 - Headers controlled by the Streamable-HTTP transport, such as `content-type`, `accept`, `mcp-session-id`, and `mcp-protocol-version`, cannot be overridden.
