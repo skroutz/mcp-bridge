@@ -93,6 +93,7 @@ const STALE_CLIENT_OAUTH_ERRORS = new Set(["invalid_client", "unauthorized_clien
 let stdioTransport;
 let remoteTransport;
 let oauthProvider;
+let oauthFlowCoordinator;
 let UnauthorizedErrorCtor;
 let closing = false;
 
@@ -718,6 +719,55 @@ function combineAbortSignals(signals) {
   return controller.signal;
 }
 
+class OAuthFlowCoordinator {
+  constructor(provider) {
+    this.provider = provider;
+    this.initialGateUsers = 0;
+    this.initialSendTail = Promise.resolve();
+    this.authorizationPromise = undefined;
+  }
+
+  async runWithInitialAuthGate(operation) {
+    if (this.initialGateUsers === 0 && await this.provider.tokens()) {
+      return await operation();
+    }
+
+    this.initialGateUsers += 1;
+    let release;
+    const previous = this.initialSendTail;
+    this.initialSendTail = new Promise((resolveRelease) => {
+      release = resolveRelease;
+    });
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      this.initialGateUsers -= 1;
+      release();
+    }
+  }
+
+  async completeAuthorization(operation) {
+    if (this.authorizationPromise) {
+      log("info", "joining active OAuth authorization flow");
+      return await this.authorizationPromise;
+    }
+
+    log("info", "starting OAuth authorization completion");
+    const authorizationPromise = Promise.resolve().then(operation);
+    this.authorizationPromise = authorizationPromise;
+
+    try {
+      return await authorizationPromise;
+    } finally {
+      if (this.authorizationPromise === authorizationPromise) {
+        this.authorizationPromise = undefined;
+      }
+    }
+  }
+}
+
 class BridgeOAuthProvider {
   constructor(config) {
     this.config = config;
@@ -726,6 +776,7 @@ class BridgeOAuthProvider {
     this.pendingCallback = undefined;
     this.currentState = undefined;
     this.codeVerifierValue = undefined;
+    this.authorizationRedirectPromise = undefined;
     this.staleClientRecoveryUsed = false;
   }
 
@@ -750,7 +801,9 @@ class BridgeOAuthProvider {
   }
 
   async state() {
-    this.currentState = randomBytes(24).toString("base64url");
+    if (!this.currentState) {
+      this.currentState = randomBytes(24).toString("base64url");
+    }
     return this.currentState;
   }
 
@@ -783,10 +836,43 @@ class BridgeOAuthProvider {
   }
 
   async redirectToAuthorization(authorizationUrl) {
+    const authorizationState = authorizationUrl.searchParams.get("state");
+    if (this.currentState && authorizationState !== this.currentState) {
+      log("info", "ignoring superseded OAuth authorization redirect");
+      return;
+    }
+
+    const codeChallenge = authorizationUrl.searchParams.get("code_challenge");
+    if (this.codeVerifierValue && codeChallenge && codeChallenge !== createPkceCodeChallenge(this.codeVerifierValue)) {
+      log("info", "ignoring OAuth authorization redirect for a superseded PKCE verifier");
+      return;
+    }
+
+    if (this.authorizationRedirectPromise) {
+      log("info", "OAuth browser authorization is already active; reusing it");
+      return await this.authorizationRedirectPromise;
+    }
+
+    const redirectPromise = this.startAuthorizationRedirect(authorizationUrl);
+    this.authorizationRedirectPromise = redirectPromise;
+
+    try {
+      await redirectPromise;
+    } catch (error) {
+      if (this.authorizationRedirectPromise === redirectPromise) {
+        this.authorizationRedirectPromise = undefined;
+      }
+      throw error;
+    }
+  }
+
+  async startAuthorizationRedirect(authorizationUrl) {
+    const redirectStartedAt = Date.now();
     await this.assertAuthorizationClientIsValid(authorizationUrl);
 
     if (!this.pendingCallback) {
-      this.pendingCallback = await createOAuthCallbackWaiter({
+      const callbackWaiterFactory = this.config.oauth.callbackWaiterFactory ?? createOAuthCallbackWaiter;
+      this.pendingCallback = await callbackWaiterFactory({
         expectedPath: this.redirectUrl.pathname,
         expectedState: this.currentState,
         host: this.redirectUrl.hostname,
@@ -806,8 +892,12 @@ class BridgeOAuthProvider {
       return;
     }
 
-    await openBrowser(authorizationUrl).then((method) => {
-      log("info", "OAuth browser launch command completed", { method });
+    const browserOpener = this.config.oauth.browserOpener ?? openBrowser;
+    await browserOpener(authorizationUrl).then((method) => {
+      log("info", "OAuth browser launch command completed", {
+        durationMs: Date.now() - redirectStartedAt,
+        method
+      });
     }).catch((error) => {
       log("error", "unable to open browser automatically", {
         oauthUrl: authorizationUrl.toString(),
@@ -849,16 +939,21 @@ class BridgeOAuthProvider {
       throw new Error("OAuth authorization callback was not started.");
     }
 
+    const pendingCallback = this.pendingCallback;
     try {
-      return await this.pendingCallback.codePromise;
+      return await pendingCallback.codePromise;
     } finally {
-      await this.pendingCallback.close();
-      this.pendingCallback = undefined;
+      await pendingCallback.close();
+      if (this.pendingCallback === pendingCallback) {
+        this.pendingCallback = undefined;
+      }
     }
   }
 
   async saveCodeVerifier(codeVerifier) {
-    this.codeVerifierValue = codeVerifier;
+    if (!this.codeVerifierValue) {
+      this.codeVerifierValue = codeVerifier;
+    }
   }
 
   async codeVerifier() {
@@ -901,6 +996,7 @@ class BridgeOAuthProvider {
     }
 
     this.staleClientRecoveryUsed = true;
+    await this.resetAuthorizationFlow();
     await this.invalidateCredentials("all");
     log("info", "cleared stale OAuth client cache; restarting authorization", { reason });
     return true;
@@ -908,6 +1004,16 @@ class BridgeOAuthProvider {
 
   async clearSession() {
     await this.invalidateCredentials("all");
+  }
+
+  async resetAuthorizationFlow() {
+    const pendingCallback = this.pendingCallback;
+    this.pendingCallback = undefined;
+    this.currentState = undefined;
+    this.codeVerifierValue = undefined;
+    this.authorizationRedirectPromise = undefined;
+    pendingCallback?.cancel?.(new Error("OAuth authorization was cancelled."));
+    await pendingCallback?.close();
   }
 
   async readStore() {
@@ -960,6 +1066,10 @@ class BridgeOAuthProvider {
     store.updatedAt = new Date().toISOString();
     await writeJsonPrivate(this.config.oauth.storagePath, store);
   }
+}
+
+function createPkceCodeChallenge(codeVerifier) {
+  return createHash("sha256").update(codeVerifier).digest("base64url");
 }
 
 function createOAuthSessionKey(endpointUrl, redirectUrl) {
@@ -1043,6 +1153,12 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
       return;
     }
 
+    if (expectedState && state !== expectedState) {
+      response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Invalid OAuth state.");
+      return;
+    }
+
     if (error) {
       response.writeHead(400, { "content-type": "text/html; charset=utf-8" });
       response.end(oauthHtml("Authorization failed", "Claude Desktop can be reopened after retrying the login."));
@@ -1054,13 +1170,6 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
       response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       response.end("Missing authorization code.");
       finish(new Error("OAuth callback did not include an authorization code."));
-      return;
-    }
-
-    if (expectedState && state !== expectedState) {
-      response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
-      response.end("Invalid OAuth state.");
-      finish(new Error("OAuth callback state did not match."));
       return;
     }
 
@@ -1076,6 +1185,7 @@ async function createOAuthCallbackWaiter({ expectedPath, expectedState, host, po
   return {
     codePromise,
     port: server.address().port,
+    cancel: (error = new Error("OAuth authorization was cancelled.")) => finish(error),
     close: () => new Promise((resolveClose) => {
       server.close(() => resolveClose());
     })
@@ -1299,6 +1409,7 @@ async function startBridge(config) {
   ]);
   UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = config.oauth ? new BridgeOAuthProvider(config) : undefined;
+  oauthFlowCoordinator = oauthProvider ? new OAuthFlowCoordinator(oauthProvider) : undefined;
   await clearOAuthSessionIfRequested(config, oauthProvider);
 
   stdioTransport = new StdioServerTransport(process.stdin, process.stdout, {
@@ -1347,21 +1458,26 @@ async function forwardMessage(direction, targetTransport, message) {
     return;
   }
 
+  if (direction === "stdio->http" && oauthFlowCoordinator) {
+    await oauthFlowCoordinator.runWithInitialAuthGate(async () => {
+      await forwardMessageAttempt(direction, targetTransport, message);
+    });
+    return;
+  }
+
+  await forwardMessageAttempt(direction, targetTransport, message);
+}
+
+async function forwardMessageAttempt(direction, targetTransport, message) {
+  if (closing) {
+    return;
+  }
+
   try {
     await targetTransport.send(message);
   } catch (error) {
     if (direction === "stdio->http" && oauthProvider && isStaleOAuthClientError(error, oauthProvider)) {
-      await recoverStaleOAuthClient({
-        config: oauthProvider.config,
-        error,
-        provider: oauthProvider,
-        startAuthorization: beginOAuthAuthorization
-      }).then(async (recovered) => {
-        if (!recovered) {
-          throw error;
-        }
-        await completeOAuthAndRetry(targetTransport, message);
-      }).catch(async (authError) => {
+      await completeOAuthAndRetry(targetTransport, message, error).catch(async (authError) => {
         log("error", "OAuth stale-client recovery failed", errorMetadata(authError));
         await invalidateOAuthSession(oauthProvider, "OAuth stale-client recovery failed");
         await requestShutdown(1, "OAuth stale-client recovery failed");
@@ -1387,29 +1503,58 @@ function isUnauthorizedError(error) {
   return Boolean(UnauthorizedErrorCtor && error instanceof UnauthorizedErrorCtor);
 }
 
-async function completeOAuthAndRetry(targetTransport, message) {
-  await completeOAuthAuthorization({
-    config: oauthProvider.config,
-    provider: oauthProvider,
-    finishAuthorization: async (authorizationCode) => {
-      await targetTransport.finishAuth(authorizationCode);
+async function completeOAuthAndRetry(targetTransport, message, staleClientError = undefined) {
+  await oauthFlowCoordinator.completeAuthorization(async () => {
+    if (staleClientError) {
+      const recovered = await recoverStaleOAuthClient({
+        config: oauthProvider.config,
+        error: staleClientError,
+        provider: oauthProvider,
+        startAuthorization: beginOAuthAuthorization
+      });
+      if (!recovered) {
+        throw staleClientError;
+      }
     }
+
+    await completeOAuthAuthorization({
+      config: oauthProvider.config,
+      provider: oauthProvider,
+      finishAuthorization: async (authorizationCode) => {
+        await targetTransport.finishAuth(authorizationCode);
+      }
+    });
   });
   log("info", "OAuth authorization complete; retrying MCP request");
-  await targetTransport.send(message);
+  try {
+    await targetTransport.send(message);
+  } catch (error) {
+    log("error", "failed to retry MCP request after OAuth authorization", errorMetadata(error));
+    await requestShutdown(1, "OAuth-authenticated MCP retry failed");
+  }
 }
 
 async function completeOAuthAuthorization({ config, provider, finishAuthorization, startAuthorization = beginOAuthAuthorization }) {
   while (true) {
     log("info", "waiting for OAuth browser authorization");
+    const callbackWaitStartedAt = Date.now();
     try {
       const authorizationCode = await provider.waitForAuthorizationCode();
+      log("info", "OAuth callback received", {
+        waitDurationMs: Date.now() - callbackWaitStartedAt
+      });
+      const tokenExchangeStartedAt = Date.now();
       await finishAuthorization(authorizationCode);
+      log("info", "OAuth token exchange completed", {
+        durationMs: Date.now() - tokenExchangeStartedAt
+      });
+      await provider.resetAuthorizationFlow?.();
       return;
     } catch (error) {
       if (await recoverStaleOAuthClient({ config, error, provider, startAuthorization })) {
         continue;
       }
+      await provider.resetAuthorizationFlow?.();
       await invalidateOAuthSession(provider, "OAuth authorization failed");
       throw error;
     }
@@ -1535,6 +1680,10 @@ async function requestShutdown(exitCode, reason) {
 }
 
 async function closeTransports() {
+  await oauthProvider?.resetAuthorizationFlow?.().catch((error) => {
+    log("error", "failed to cancel active OAuth authorization", errorMetadata(error));
+  });
+
   if (remoteTransport?.terminateSession) {
     await Promise.race([
       remoteTransport.terminateSession(),
@@ -1722,6 +1871,7 @@ if (process.env.MCP_BRIDGE_TEST_MODE !== "1") {
 export {
   BridgeOAuthProvider,
   OAuthAuthorizationError,
+  OAuthFlowCoordinator,
   completeOAuthAuthorization,
   createOAuthCallbackWaiter
 };
