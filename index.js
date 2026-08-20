@@ -610,7 +610,7 @@ async function fetchWithNodeHttp(input, init = {}, { ca, redirectCount }) {
         const redirectInit = {
           ...init,
           body: status === 303 ? undefined : init.body,
-          headers,
+          headers: sanitizeRedirectHeaders(headers, url, redirectUrl),
           method: status === 303 ? "GET" : method
         };
         fetchWithNodeHttp(redirectUrl, redirectInit, { ca, redirectCount: redirectCount + 1 })
@@ -702,6 +702,22 @@ async function normalizeFetchBody(body) {
 
 function isRedirectStatus(status) {
   return [301, 302, 303, 307, 308].includes(status);
+}
+
+function sanitizeRedirectHeaders(headers, fromUrl, toUrl) {
+  if (isSameOrigin(fromUrl, toUrl)) {
+    return headers;
+  }
+
+  const sanitized = { ...headers };
+  delete sanitized.authorization;
+  delete sanitized.cookie;
+  delete sanitized["proxy-authorization"];
+  return sanitized;
+}
+
+function isSameOrigin(a, b) {
+  return a.protocol === b.protocol && a.hostname === b.hostname && a.port === b.port;
 }
 
 function responseCanHaveBody(status) {
