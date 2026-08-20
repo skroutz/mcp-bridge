@@ -1531,7 +1531,7 @@ function openBrowserLinuxCommands(target) {
         continue;
       }
       commands.push(command.includes("%s")
-        ? { command: "sh", args: ["-c", `${command} "$0"`, target], method: `browser-env:${command}` }
+        ? { command: "sh", args: ["-c", command.replaceAll("%s", '"$0"'), target], method: `browser-env:${command}` }
         : { command, args: [target], method: `browser-env:${command}` });
     }
   }
