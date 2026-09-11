@@ -177,11 +177,13 @@ test("OAuth registration metadata uses the selected callback port", async () => 
     });
     const provider = new BridgeOAuthProvider(config);
     await provider.saveClientInformation({ client_id: "old-port-client" });
+    await provider.saveTokens({ access_token: "old-access", refresh_token: "old-refresh", token_type: "Bearer" });
 
     assert.equal(await provider.prepareAuthorization(), true);
     assert.equal(provider.redirectUrl.port, "33419");
     assert.deepEqual(provider.clientMetadata.redirect_uris, ["http://127.0.0.1:33419/oauth/callback"]);
     assert.equal(await provider.clientInformation(), undefined);
+    assert.equal(await provider.tokens(), undefined);
 
     await provider.releaseAuthorizationOwnership();
   });

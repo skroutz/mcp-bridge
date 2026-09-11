@@ -96,7 +96,6 @@ let remoteTransport;
 let oauthProvider;
 let oauthFlowCoordinator;
 let initializationBarrier;
-let UnauthorizedErrorCtor;
 let closing = false;
 
 function log(level, message, extra = undefined) {
@@ -125,6 +124,12 @@ function errorMetadata(error) {
 
   if (error.code) {
     metadata.code = error.code;
+  }
+  if (error.errorCode || error.oauthError) {
+    metadata.oauthError = error.errorCode ?? error.oauthError;
+  }
+  if (error.oauthGrantType) {
+    metadata.grantType = error.oauthGrantType;
   }
 
   if (error.cause instanceof Error) {
@@ -723,59 +728,148 @@ function combineAbortSignals(signals) {
 }
 
 class OAuthFlowCoordinator {
-  constructor(provider) {
+  constructor(provider, { fetchFn, authFetchFn } = {}) {
     this.provider = provider;
-    this.initialRequestCompleted = false;
-    this.initialGateUsers = 0;
-    this.initialSendTail = Promise.resolve();
-    this.authorizationPromise = undefined;
+    this.config = provider.config;
+    this.resourceFetch = fetchFn ?? makeBridgeFetch(this.config) ?? fetch;
+    this.authorizationFetch = authFetchFn ?? fetchFn ?? makeBridgeFetch(this.config, 30_000) ?? fetch;
+    this.authorizationTail = Promise.resolve();
+    this.abortController = new AbortController();
+    this.fetch = this.fetch.bind(this);
   }
 
-  async runWithInitialAuthGate(operation) {
-    if (this.initialRequestCompleted) {
-      return await operation();
-    }
+  // All SDK transport requests, including SSE reconnects, use this fetch. OAuth
+  // itself still runs through the SDK, but never outside our authorization lock.
+  async fetch(url, init = {}) {
+    const { extractWWWAuthenticateParams } = await import("@modelcontextprotocol/sdk/client/auth.js");
+    const attemptedChallenges = new Set();
+    while (true) {
+      init.signal?.throwIfAborted();
+      const previousTokens = await this.provider.tokens();
+      const headers = new Headers(init.headers);
+      if (previousTokens?.access_token) {
+        headers.set("authorization", `Bearer ${previousTokens.access_token}`);
+      } else {
+        headers.delete("authorization");
+      }
+      const response = await this.resourceFetch(url, { ...init, headers });
+      // Session termination must not open a browser or start a refresh.
+      if (this.abortController.signal.aborted || init.method?.toUpperCase() === "DELETE") {
+        return response;
+      }
+      const challenge = extractWWWAuthenticateParams(response);
+      const upscope = response.status === 403 && challenge.error === "insufficient_scope";
+      if (response.status !== 401 && !upscope) {
+        return response;
+      }
 
-    this.initialGateUsers += 1;
+      // At most one 401 recovery and one insufficient-scope recovery per HTTP
+      // request. Return subsequent errors to the SDK without an auth provider.
+      if (attemptedChallenges.has(response.status)) {
+        return response;
+      }
+      attemptedChallenges.add(response.status);
+      await response.body?.cancel();
+      await this.authorize({
+        previousTokens,
+        resourceMetadataUrl: challenge.resourceMetadataUrl,
+        scope: challenge.scope,
+        requiredScope: upscope ? challenge.scope : undefined
+      });
+    }
+  }
+
+  async fetchAuthorization(url, init = {}) {
+    const headers = new Headers(this.config.headers);
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+    const response = await this.authorizationFetch(url, { ...init, headers });
+    if (response.status === 400 && init.method === "POST"
+      && init.body instanceof URLSearchParams && init.body.get("grant_type") === "refresh_token") {
+      const { parseErrorResponse } = await import("@modelcontextprotocol/sdk/client/auth.js");
+      const error = await parseErrorResponse(response.clone());
+      if (error.errorCode === "invalid_request") {
+        await response.body?.cancel();
+        // Keep the SDK OAuthError type so its refresh handler propagates this
+        // failure. Only this grant-specific error is eligible for our reset.
+        error.oauthGrantType = "refresh_token";
+        throw error;
+      }
+    }
+    return response;
+  }
+
+  async authorize(options = {}) {
+    // Queue authorization attempts, not tool calls or response streams. Each
+    // waiter rechecks the cache under the process lock before using a refresh token.
     let release;
-    const previous = this.initialSendTail;
-    this.initialSendTail = new Promise((resolveRelease) => {
+    const previous = this.authorizationTail;
+    this.authorizationTail = new Promise((resolveRelease) => {
       release = resolveRelease;
     });
-
     await previous;
     try {
-      if (this.initialRequestCompleted) {
-        return await operation();
+      this.abortController.signal.throwIfAborted();
+      const owner = await this.provider.prepareAuthorization({
+        ...options,
+        signal: this.abortController.signal
+      });
+      if (!owner) {
+        return;
       }
-      await this.provider.prepareAuthorization?.();
-      const result = await operation();
-      this.initialRequestCompleted = true;
-      return result;
+      this.abortController.signal.throwIfAborted();
+      await this.runAuthorization(options);
     } finally {
-      this.initialGateUsers -= 1;
-      await this.provider.releaseAuthorizationOwnership?.();
-      release();
+      try {
+        await this.provider.releaseAuthorizationOwnership();
+      } finally {
+        release();
+      }
     }
   }
 
-  async completeAuthorization(operation) {
-    if (this.authorizationPromise) {
-      log("info", "joining active OAuth authorization flow");
-      return await this.authorizationPromise;
-    }
-
-    log("info", "starting OAuth authorization completion");
-    const authorizationPromise = Promise.resolve().then(operation);
-    this.authorizationPromise = authorizationPromise;
-
-    try {
-      return await authorizationPromise;
-    } finally {
-      if (this.authorizationPromise === authorizationPromise) {
-        this.authorizationPromise = undefined;
+  async runAuthorization(options) {
+    const { auth } = await import("@modelcontextprotocol/sdk/client/auth.js");
+    const authenticate = (authorizationCode) => auth(this.provider, {
+      serverUrl: this.config.url,
+      resourceMetadataUrl: options.resourceMetadataUrl,
+      scope: options.scope,
+      authorizationCode,
+      fetchFn: this.fetchAuthorization.bind(this)
+    });
+    const startAuthorization = async () => {
+      await this.provider.prepareAuthorization();
+      const result = await authenticate();
+      if (result !== "REDIRECT") {
+        throw new Error(`Expected OAuth authorization redirect after clearing stale credentials, got ${result}.`);
       }
+    };
+    let result;
+    try {
+      result = await authenticate();
+    } catch (error) {
+      if (!await recoverStaleOAuthClient({
+        config: this.config, provider: this.provider, error, startAuthorization
+      })) {
+        throw error;
+      }
+      result = "REDIRECT";
     }
+    if (result === "REDIRECT") {
+      await completeOAuthAuthorization({
+        config: this.config,
+        provider: this.provider,
+        startAuthorization,
+        finishAuthorization: authenticate
+      });
+    }
+  }
+
+  async close() {
+    this.abortController.abort(new Error("OAuth authorization was cancelled."));
+    this.provider.authorizationClosed = true;
+    await this.provider.resetAuthorizationFlow();
+    // A refresh already in flight retains its lock until saveTokens completes.
+    await this.authorizationTail;
   }
 }
 
@@ -841,34 +935,53 @@ class BridgeOAuthProvider {
     this.authorizationRedirectPromise = undefined;
     this.authorizationFlowGeneration = 0;
     this.staleClientRecoveryUsed = false;
+    this.authorizationClosed = false;
   }
 
   get redirectUrl() {
     return this.config.oauth.redirectUrl;
   }
 
-  async prepareAuthorization() {
+  async prepareAuthorization(options = {}) {
+    options.signal?.throwIfAborted();
+    if (this.authorizationClosed) {
+      throw new Error("OAuth authorization was cancelled.");
+    }
     if (this.authorizationLock) {
       await this.prepareAuthorizationCallback();
       return true;
     }
 
-    const startingTokenFingerprint = tokenFingerprint(await this.tokens());
+    const startingTokenFingerprint = tokenFingerprint(Object.hasOwn(options, "previousTokens")
+      ? options.previousTokens : await this.tokens());
     let loggedWaiting = false;
     while (true) {
+      options.signal?.throwIfAborted();
       const lock = await tryAcquireProcessLock(this.authorizationLockPath);
       if (lock) {
-        const currentTokens = await this.tokens();
-        if (loggedWaiting && currentTokens && tokenFingerprint(currentTokens) !== startingTokenFingerprint) {
-          await lock.release();
-          return false;
+        try {
+          options.signal?.throwIfAborted();
+          const currentTokens = await this.tokens();
+          if (currentTokens?.access_token && tokenFingerprint(currentTokens) !== startingTokenFingerprint
+            && hasOAuthScope(currentTokens, options.requiredScope)) {
+            await lock.release();
+            return false;
+          }
+          this.authorizationLock = lock;
+          await this.prepareAuthorizationCallback();
+          log("info", "acquired OAuth authorization ownership", {
+            callback: this.redirectUrl.toString()
+          });
+          return true;
+        } catch (error) {
+          this.authorizationLock = undefined;
+          try {
+            await this.resetAuthorizationFlow();
+          } finally {
+            await lock.release();
+          }
+          throw error;
         }
-        this.authorizationLock = lock;
-        await this.prepareAuthorizationCallback();
-        log("info", "acquired OAuth authorization ownership", {
-          callback: this.redirectUrl.toString()
-        });
-        return true;
       }
 
       if (!loggedWaiting) {
@@ -880,6 +993,9 @@ class BridgeOAuthProvider {
   }
 
   async prepareAuthorizationCallback() {
+    if (this.authorizationClosed) {
+      throw new Error("OAuth authorization was cancelled.");
+    }
     if (this.pendingCallback) {
       return;
     }
@@ -910,6 +1026,7 @@ class BridgeOAuthProvider {
         : configuredPort;
       if (previousCallbackPort !== callback.port) {
         delete currentSession.clientInformation;
+        delete currentSession.tokens;
       }
       currentSession.callbackPort = callback.port;
       return currentSession;
@@ -972,7 +1089,12 @@ class BridgeOAuthProvider {
   }
 
   async saveClientInformation(clientInformation) {
-    await this.updateSession({ clientInformation });
+    await this.mutateSession((session) => {
+      if (session.clientInformation?.client_id !== clientInformation.client_id) {
+        delete session.tokens;
+      }
+      return { ...session, clientInformation };
+    });
   }
 
   async tokens() {
@@ -1147,7 +1269,7 @@ class BridgeOAuthProvider {
       if (scope === "all" || scope === "client") {
         delete session.clientInformation;
       }
-      if (scope === "all" || scope === "tokens") {
+      if (scope === "all" || scope === "tokens" || scope === "client") {
         delete session.tokens;
       }
       if (scope === "all" || scope === "discovery") {
@@ -1253,6 +1375,14 @@ function createPkceCodeChallenge(codeVerifier) {
 
 function tokenFingerprint(tokens) {
   return createHash("sha256").update(JSON.stringify(tokens ?? null)).digest("base64url");
+}
+
+function hasOAuthScope(tokens, requiredScope) {
+  if (!requiredScope) {
+    return true;
+  }
+  const granted = new Set((tokens.scope ?? "").split(/\s+/));
+  return requiredScope.split(/\s+/).every((scope) => granted.has(scope));
 }
 
 function createOAuthSessionKey(endpointUrl, redirectUrl) {
@@ -1704,14 +1834,11 @@ function spawnAndWait(command, args, { env, waitForExitMs = 4000 } = {}) {
 async function startBridge(config) {
   const [
     { StdioServerTransport },
-    { StreamableHTTPClientTransport },
-    { UnauthorizedError }
+    { StreamableHTTPClientTransport }
   ] = await Promise.all([
     import("@modelcontextprotocol/sdk/server/stdio.js"),
-    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
-    import("@modelcontextprotocol/sdk/client/auth.js")
+    import("@modelcontextprotocol/sdk/client/streamableHttp.js")
   ]);
-  UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = config.oauth ? new BridgeOAuthProvider(config) : undefined;
   oauthFlowCoordinator = oauthProvider ? new OAuthFlowCoordinator(oauthProvider) : undefined;
   initializationBarrier = new McpInitializationBarrier();
@@ -1721,8 +1848,7 @@ async function startBridge(config) {
     maxBufferSize: config.maxBufferSize
   });
   remoteTransport = new StreamableHTTPClientTransport(config.url, {
-    authProvider: oauthProvider,
-    fetch: makeBridgeFetch(config),
+    fetch: oauthFlowCoordinator?.fetch ?? makeBridgeFetch(config),
     requestInit: {
       headers: config.headers
     }
@@ -1765,12 +1891,6 @@ async function forwardMessage(direction, targetTransport, message) {
 
   if (direction === "stdio->http") {
     await initializationBarrier.forward(message, async () => {
-      if (oauthFlowCoordinator) {
-        await oauthFlowCoordinator.runWithInitialAuthGate(async () => {
-          await forwardMessageAttempt(direction, targetTransport, message);
-        });
-        return;
-      }
       await forwardMessageAttempt(direction, targetTransport, message);
     });
     return;
@@ -1787,65 +1907,12 @@ async function forwardMessageAttempt(direction, targetTransport, message) {
   try {
     await targetTransport.send(message);
   } catch (error) {
-    if (direction === "stdio->http" && oauthProvider && isStaleOAuthClientError(error, oauthProvider)) {
-      await completeOAuthAndRetry(targetTransport, message, error).catch(async (authError) => {
-        log("error", "OAuth stale-client recovery failed", errorMetadata(authError));
-        await invalidateOAuthSession(oauthProvider, "OAuth stale-client recovery failed");
-        await requestShutdown(1, "OAuth stale-client recovery failed");
-      });
-      return;
-    }
-
-    if (direction === "stdio->http" && oauthProvider && isUnauthorizedError(error)) {
-      await completeOAuthAndRetry(targetTransport, message).catch(async (authError) => {
-        log("error", "OAuth authorization failed", errorMetadata(authError));
-        await invalidateOAuthSession(oauthProvider, "OAuth authorization failed");
-        await requestShutdown(1, "OAuth authorization failed");
-      });
-      return;
-    }
-
     log("error", `failed to forward ${direction}`, errorMetadata(error));
     await requestShutdown(1, `forwarding failed: ${direction}`);
   }
 }
 
-function isUnauthorizedError(error) {
-  return Boolean(UnauthorizedErrorCtor && error instanceof UnauthorizedErrorCtor);
-}
-
-async function completeOAuthAndRetry(targetTransport, message, staleClientError = undefined) {
-  await oauthFlowCoordinator.completeAuthorization(async () => {
-    if (staleClientError) {
-      const recovered = await recoverStaleOAuthClient({
-        config: oauthProvider.config,
-        error: staleClientError,
-        provider: oauthProvider,
-        startAuthorization: beginOAuthAuthorization
-      });
-      if (!recovered) {
-        throw staleClientError;
-      }
-    }
-
-    await completeOAuthAuthorization({
-      config: oauthProvider.config,
-      provider: oauthProvider,
-      finishAuthorization: async (authorizationCode) => {
-        await targetTransport.finishAuth(authorizationCode);
-      }
-    });
-  });
-  log("info", "OAuth authorization complete; retrying MCP request");
-  try {
-    await targetTransport.send(message);
-  } catch (error) {
-    log("error", "failed to retry MCP request after OAuth authorization", errorMetadata(error));
-    await requestShutdown(1, "OAuth-authenticated MCP retry failed");
-  }
-}
-
-async function completeOAuthAuthorization({ config, provider, finishAuthorization, startAuthorization = beginOAuthAuthorization }) {
+async function completeOAuthAuthorization({ config, provider, finishAuthorization, startAuthorization }) {
   while (true) {
     log("info", "waiting for OAuth browser authorization");
     const callbackWaitStartedAt = Date.now();
@@ -1877,7 +1944,10 @@ async function recoverStaleOAuthClient({ config, error, provider, startAuthoriza
     return false;
   }
 
-  const recovered = await provider.recoverStaleClient(error.oauthError ?? error.message);
+  const reason = error.oauthGrantType === "refresh_token"
+    ? "refresh request rejected: invalid_request"
+    : error.errorCode ?? error.oauthError ?? error.message;
+  const recovered = await provider.recoverStaleClient(reason);
   if (!recovered) {
     log("error", "OAuth stale-client recovery was already attempted; refusing to retry again", errorMetadata(error));
     return false;
@@ -1888,7 +1958,10 @@ async function recoverStaleOAuthClient({ config, error, provider, startAuthoriza
 }
 
 function isStaleOAuthClientError(error, provider) {
-  if (error?.oauthError && STALE_CLIENT_OAUTH_ERRORS.has(error.oauthError)) {
+  if (STALE_CLIENT_OAUTH_ERRORS.has(error?.errorCode ?? error?.oauthError)) {
+    return true;
+  }
+  if (error?.errorCode === "invalid_request" && error.oauthGrantType === "refresh_token") {
     return true;
   }
 
@@ -1898,18 +1971,6 @@ function isStaleOAuthClientError(error, provider) {
   return error instanceof Error
     && error.message === "Existing OAuth client information is required when exchanging an authorization code"
     && provider.staleClientRecoveryUsed === false;
-}
-
-async function beginOAuthAuthorization(provider, config) {
-  await provider.prepareAuthorization();
-  const { auth } = await import("@modelcontextprotocol/sdk/client/auth.js");
-  const result = await auth(provider, {
-    serverUrl: config.url,
-    fetchFn: makeBridgeFetch(config, 30000)
-  });
-  if (result !== "REDIRECT") {
-    throw new Error(`Expected OAuth authorization redirect after clearing stale client, got ${result}.`);
-  }
 }
 
 async function invalidateOAuthSession(provider, reason) {
@@ -1992,11 +2053,8 @@ async function requestShutdown(exitCode, reason) {
 }
 
 async function closeTransports() {
-  await oauthProvider?.resetAuthorizationFlow?.().catch((error) => {
-    log("error", "failed to cancel active OAuth authorization", errorMetadata(error));
-  });
-  await oauthProvider?.releaseAuthorizationOwnership?.().catch((error) => {
-    log("error", "failed to release OAuth authorization ownership", errorMetadata(error));
+  await oauthFlowCoordinator?.close().catch((error) => {
+    log("error", "failed to close OAuth authorization", errorMetadata(error));
   });
 
   if (remoteTransport?.terminateSession) {
@@ -2022,19 +2080,18 @@ async function closeTransports() {
 
 async function runOAuthLogin(config) {
   const [
-    { auth, UnauthorizedError },
     { Client },
     { StreamableHTTPClientTransport }
   ] = await Promise.all([
-    import("@modelcontextprotocol/sdk/client/auth.js"),
     import("@modelcontextprotocol/sdk/client/index.js"),
     import("@modelcontextprotocol/sdk/client/streamableHttp.js")
   ]);
 
-  UnauthorizedErrorCtor = UnauthorizedError;
   oauthProvider = new BridgeOAuthProvider(config);
   await clearOAuthSessionIfRequested(config, oauthProvider);
-  const fetchFn = makeBridgeFetch(config, 30000);
+  oauthFlowCoordinator = new OAuthFlowCoordinator(oauthProvider, {
+    fetchFn: makeBridgeFetch(config, 30000)
+  });
 
   log("info", "starting OAuth login", {
     bridgeCaBundle: Boolean(config.caBundle),
@@ -2043,51 +2100,17 @@ async function runOAuthLogin(config) {
     timeoutMs: config.timeoutMs ?? 30000
   });
 
-  let result;
   try {
-    try {
-      await oauthProvider.prepareAuthorization();
-      result = await auth(oauthProvider, {
-        serverUrl: config.url,
-        fetchFn
-      });
-    } catch (error) {
-      const recovered = await recoverStaleOAuthClient({
-        config,
-        error,
-        provider: oauthProvider,
-        startAuthorization: beginOAuthAuthorization
-      });
-      if (!recovered) {
-        await invalidateOAuthSession(oauthProvider, "OAuth login setup failed");
-        throw error;
-      }
-      result = "REDIRECT";
-    }
-
-    if (result === "REDIRECT") {
-      await completeOAuthAuthorization({
-        config,
-        provider: oauthProvider,
-        finishAuthorization: async (authorizationCode) => {
-          await auth(oauthProvider, {
-            serverUrl: config.url,
-            authorizationCode,
-            fetchFn
-          });
-        }
-      });
-    }
+    await oauthFlowCoordinator.authorize();
 
     await connectOAuthClient({
       Client,
       StreamableHTTPClientTransport,
       config,
-      fetchFn,
-      provider: oauthProvider
+      fetchFn: oauthFlowCoordinator.fetch
     });
   } finally {
-    await oauthProvider.releaseAuthorizationOwnership();
+    await oauthFlowCoordinator.close();
   }
 
   log("info", "OAuth login complete", {
@@ -2096,10 +2119,9 @@ async function runOAuthLogin(config) {
   });
 }
 
-async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn, provider }) {
+async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn }) {
   const version = await readPackageVersion();
   const transport = new StreamableHTTPClientTransport(config.url, {
-    authProvider: provider,
     fetch: fetchFn ?? makeBridgeFetch(config),
     requestInit: {
       headers: config.headers
@@ -2118,34 +2140,8 @@ async function connectOAuthClient({ Client, StreamableHTTPClientTransport, confi
       transport.terminateSession(),
       delay(1500)
     ]).catch(() => undefined);
+  } finally {
     await client.close();
-  } catch (error) {
-    if (isUnauthorizedError(error) || isStaleOAuthClientError(error, provider)) {
-      if (isStaleOAuthClientError(error, provider)) {
-        const recovered = await recoverStaleOAuthClient({
-          config,
-          error,
-          provider,
-          startAuthorization: beginOAuthAuthorization
-        });
-        if (!recovered) {
-          await transport.close().catch(() => undefined);
-          throw error;
-        }
-      }
-      await completeOAuthAuthorization({
-        config,
-        provider,
-        finishAuthorization: async (authorizationCode) => {
-          await transport.finishAuth(authorizationCode);
-        }
-      });
-      await transport.close().catch(() => undefined);
-      log("info", "OAuth authorization complete; verifying cached credentials");
-      return connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn, provider });
-    }
-    await transport.close().catch(() => undefined);
-    throw error;
   }
 }
 

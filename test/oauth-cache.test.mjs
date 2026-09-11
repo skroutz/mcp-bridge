@@ -293,62 +293,8 @@ test("OAuth browser launch is cancelled when the probe exits during stabilizatio
   });
 });
 
-test("concurrent authorization completions exchange the code once", async () => {
-  const coordinator = new OAuthFlowCoordinator({});
-  let exchanges = 0;
-  const completion = deferred();
-  const complete = async () => {
-    exchanges += 1;
-    await completion.promise;
-    return "authorized";
-  };
-
-  const waiters = Array.from({ length: 5 }, () => coordinator.completeAuthorization(complete));
-  await Promise.resolve();
-  assert.equal(exchanges, 1);
-  completion.resolve();
-  assert.deepEqual(await Promise.all(waiters), Array(5).fill("authorized"));
-});
-
-test("initial unauthenticated requests enter the OAuth path one at a time", async () => {
-  const tokens = { value: undefined };
-  const coordinator = new OAuthFlowCoordinator({
-    async tokens() {
-      return tokens.value;
-    }
-  });
-  let activeOperations = 0;
-  let maximumActiveOperations = 0;
-  let operations = 0;
-  const firstOperationEntered = deferred();
-  const releaseFirstOperation = deferred();
-
-  const run = async () => coordinator.runWithInitialAuthGate(async () => {
-    operations += 1;
-    activeOperations += 1;
-    maximumActiveOperations = Math.max(maximumActiveOperations, activeOperations);
-    if (operations === 1) {
-      tokens.value = { access_token: "access-token" };
-      firstOperationEntered.resolve();
-      await releaseFirstOperation.promise;
-    } else {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
-    }
-    activeOperations -= 1;
-  });
-
-  const firstRequest = run();
-  await firstOperationEntered.promise;
-  const laterRequests = Array.from({ length: 4 }, run);
-  releaseFirstOperation.resolve();
-  await Promise.all([firstRequest, ...laterRequests]);
-  assert.equal(operations, 5);
-  assert.equal(maximumActiveOperations, 1);
-});
-
 test("concurrent MCP requests complete through one OAuth flow", async (t) => {
   await withTemporaryDirectory(async (directory) => {
-    const { UnauthorizedError } = await import("@modelcontextprotocol/sdk/client/auth.js");
     const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
     const counters = {
       authorizationRequests: 0,
@@ -458,35 +404,23 @@ test("concurrent MCP requests complete through one OAuth flow", async (t) => {
     });
 
     const coordinator = new OAuthFlowCoordinator(provider);
-    const transport = new StreamableHTTPClientTransport(config.url, { authProvider: provider });
+    const transport = new StreamableHTTPClientTransport(config.url, { fetch: coordinator.fetch });
     const responses = [];
     transport.onmessage = (message) => responses.push(message);
     await transport.start();
 
-    const send = (id) => coordinator.runWithInitialAuthGate(async () => {
-      const message = { id, jsonrpc: "2.0", method: "tools/list", params: {} };
-      try {
-        await transport.send(message);
-      } catch (error) {
-        assert.ok(error instanceof UnauthorizedError);
-        await coordinator.completeAuthorization(async () => {
-          const authorizationCode = await provider.waitForAuthorizationCode();
-          await transport.finishAuth(authorizationCode);
-          await provider.resetAuthorizationFlow();
-        });
-        await transport.send(message);
-      }
-    });
+    const send = (id) => transport.send({ id, jsonrpc: "2.0", method: "tools/list", params: {} });
 
     try {
       await Promise.all(Array.from({ length: 5 }, (_, index) => send(index + 1)));
       assert.equal(counters.authorizationRequests, 1);
       assert.equal(counters.browserLaunches, 1);
       assert.equal(counters.tokenExchanges, 1);
-      assert.equal(counters.unauthorizedMcpRequests, 1);
+      assert.equal(counters.unauthorizedMcpRequests, 5);
       assert.equal(counters.authenticatedMcpRequests, 5);
       assert.equal(responses.length, 5);
     } finally {
+      await coordinator.close();
       await transport.close();
       await new Promise((resolveClose) => server.close(resolveClose));
     }

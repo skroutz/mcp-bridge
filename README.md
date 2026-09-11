@@ -159,6 +159,8 @@ For Claude.ai organization settings, upload the generated `.mcpb` as a local MCP
 
 If a remote authorization server invalidates a previously registered DCR client, the bridge clears that endpoint's cached session and starts one fresh DCR/browser authorization cycle automatically. Before opening a browser, it preflights the authorization URL so an authorization-endpoint HTTP 400 containing `invalid_client` also triggers this recovery. The retry is deliberately limited to one per bridge start to avoid loops or registration rate limits.
 
+Some authorization servers report rejected refresh tokens or a token/client mismatch as `invalid_request`. When that error comes specifically from a refresh-token request, the bridge performs the same bounded session reset and browser authorization. Generic HTTP failures and `invalid_request` responses from registration or authorization-code exchange do not trigger this reset. Normal `invalid_grant` recovery remains handled by the SDK.
+
 Before uploading a new MCPB release:
 
 ```bash
@@ -329,7 +331,8 @@ Precedence is config file, then environment variables, then CLI flags.
 - stdout is reserved for MCP messages; logs are written to stderr.
 - Secrets are redacted from bridge logs.
 - OAuth token/client-registration cache files are stored outside the repository in the user config directory with private file permissions where supported by the OS.
-- Concurrent bridge processes coordinate OAuth by remote connector: one process owns browser authorization while sibling processes wait for its cached credentials. Different connectors may authorize simultaneously on different loopback ports.
+- Concurrent bridge processes coordinate OAuth by remote connector throughout the connection, including refreshes and SSE reconnects. Ownership covers the token request and saving its response; waiting requests reload the cache before attempting another refresh. Authenticated MCP requests remain concurrent. Different connectors may authorize simultaneously on different loopback ports.
+- Healthy requests do not reserve an OAuth callback port. If authorization needs a different callback port, the bridge discards the previous client registration and its tokens together. Replacing or invalidating a client also discards its associated tokens.
 - Credentials embedded in endpoint URLs are rejected. Use environment variables or a config file instead.
 - Static bearer/API-key auth and OAuth browser auth are mutually exclusive modes.
 - Headers controlled by the Streamable-HTTP transport, such as `content-type`, `accept`, `mcp-session-id`, and `mcp-protocol-version`, cannot be overridden.
