@@ -1650,19 +1650,23 @@ async function openBrowser(url) {
   return await openBrowserLinux(target);
 }
 
+const SHELL_INTERPRETER_NAMES = new Set(["sh", "bash", "dash", "zsh", "ash", "ksh"]);
+
 function openBrowserLinuxCommands(target) {
   const commands = [];
   const browserEnv = process.env.BROWSER;
 
   if (browserEnv) {
     for (const entry of browserEnv.split(":")) {
-      const command = entry.trim();
-      if (!command) {
+      const trimmed = entry.trim();
+      if (!trimmed) {
         continue;
       }
-      commands.push(command.includes("%s")
-        ? { command: "sh", args: ["-c", `${command} "$0"`, target], method: `browser-env:${command}` }
-        : { command, args: [target], method: `browser-env:${command}` });
+      try {
+        commands.push(buildBrowserEnvCommand(trimmed, target));
+      } catch (error) {
+        log("info", "ignoring unusable BROWSER entry", { entry: trimmed, error: error.message });
+      }
     }
   }
 
@@ -1673,6 +1677,116 @@ function openBrowserLinuxCommands(target) {
   }
 
   return commands;
+}
+
+function buildBrowserEnvCommand(entry, target) {
+  const [command, ...args] = tokenizeShellWords(entry);
+  const scriptIndex = findScriptArgIndex([command, ...args]);
+
+  if (scriptIndex >= 0) {
+    const script = args[scriptIndex];
+    if (!script.includes("%s")) {
+      return { args: [...args, target], command, method: `browser-env:${entry}` };
+    }
+    const newArgs = [...args];
+    newArgs[scriptIndex] = script.replaceAll("%s", '"$0"');
+    newArgs.splice(scriptIndex + 1, 0, target);
+    return { args: newArgs, command, method: `browser-env:${entry}` };
+  }
+
+  // No plain -c flag found, but a token still looks like a shell name (e.g.
+  // bundled flags like `-ic`): don't splice %s into any arg, since it could
+  // still end up parsed as script source once that shell reads its flags.
+  const hasUnresolvedShell = [command, ...args].some((token) => isShellInterpreterName(token));
+  const hasPlaceholder = !hasUnresolvedShell && args.some((arg) => arg.includes("%s"));
+  const substitutedArgs = hasPlaceholder
+    ? args.map((arg) => arg.replaceAll("%s", target))
+    : [...args, target];
+
+  return { args: substitutedArgs, command, method: `browser-env:${entry}` };
+}
+
+function isShellInterpreterName(token) {
+  return typeof token === "string" && SHELL_INTERPRETER_NAMES.has(token.split("/").pop());
+}
+
+// Args-relative index of a `-c` flag's script argument, found anywhere in
+// `tokens` (command + args). Any literal `-c` token followed by a string is
+// treated as a potential script slot - not just for a fixed allowlist of
+// shell names - so an unlisted or wrapped shell (`fish -c ...`,
+// `env sh -c ...`) gets the same safe $0-substitution treatment as sh/bash.
+// -1 if there's no `-c` token with something after it.
+function findScriptArgIndex(tokens) {
+  const flagIndex = tokens.indexOf("-c");
+  if (flagIndex === -1 || typeof tokens[flagIndex + 1] !== "string") {
+    return -1;
+  }
+  return flagIndex; // tokens[flagIndex + 1] (the script) is args[flagIndex].
+}
+
+function tokenizeShellWords(input) {
+  const words = [];
+  let current = "";
+  let hasCurrent = false;
+  let quote = null;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (quote === '"') {
+      if (char === '"') {
+        quote = null;
+      } else if (char === "\\" && '"\\$`'.includes(input[index + 1])) {
+        current += input[index += 1];
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      hasCurrent = true;
+      continue;
+    }
+
+    if (char === "\\" && index + 1 < input.length) {
+      current += input[index += 1];
+      hasCurrent = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (hasCurrent) {
+        words.push(current);
+        current = "";
+        hasCurrent = false;
+      }
+      continue;
+    }
+
+    current += char;
+    hasCurrent = true;
+  }
+
+  if (quote) {
+    throw new ConfigError(`Unterminated ${quote === "'" ? "single" : "double"}-quoted string in BROWSER entry: ${input}`);
+  }
+
+  if (hasCurrent) {
+    words.push(current);
+  }
+
+  return words;
 }
 
 async function openBrowserLinux(target) {
@@ -2189,6 +2303,9 @@ export {
   McpInitializationBarrier,
   OAuthAuthorizationError,
   OAuthFlowCoordinator,
+  buildBrowserEnvCommand,
   completeOAuthAuthorization,
-  createOAuthCallbackWaiter
+  createOAuthCallbackWaiter,
+  openBrowserLinuxCommands,
+  tokenizeShellWords
 };
