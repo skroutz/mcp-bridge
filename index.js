@@ -1667,19 +1667,36 @@ async function openBrowser(url) {
   return await openBrowserLinux(target);
 }
 
+// Not exhaustive - an unlisted/renamed shell via a standalone -c is still safe via findScriptArgIndex's name-agnostic search, but bundled flags (-ic) need a listed name.
+const SHELL_INTERPRETER_NAMES = new Set(["sh", "bash", "dash", "zsh", "ash", "ksh", "fish", "csh", "tcsh", "mksh", "posh", "yash"]);
+
+// awk/gawk/mawk/nawk are deliberately excluded: they're handled only via AWK_INTERPRETER_PATTERN below (a bare positional program, not a -c flag).
+const NON_SHELL_INTERPRETER_PATTERN = /^(python|perl|ruby|node|nodejs|php|lua|tclsh|wish)[0-9.]*$/;
+
+// perl/ruby/node/lua's eval flag is -e (not -c), php's is -r; gated on the interpreter name so this never misreads something unrelated, like bash's own -e.
+const NON_SHELL_EVAL_FLAGS = [
+  { flag: "-e", pattern: /^(perl|ruby|node|nodejs|lua)[0-9.]*$/ },
+  { flag: "-r", pattern: /^php[0-9.]*$/ }
+];
+
+// awk's program is a bare positional arg with no flag to key off, so it's treated like a bundled-flag shell below: never substitute into any of its args.
+const AWK_INTERPRETER_PATTERN = /^(awk|gawk|mawk|nawk)[0-9.]*$/;
+
 function openBrowserLinuxCommands(target) {
   const commands = [];
   const browserEnv = process.env.BROWSER;
 
   if (browserEnv) {
     for (const entry of browserEnv.split(":")) {
-      const command = entry.trim();
-      if (!command) {
+      const trimmed = entry.trim();
+      if (!trimmed) {
         continue;
       }
-      commands.push(command.includes("%s")
-        ? { command: "sh", args: ["-c", `${command} "$0"`, target], method: `browser-env:${command}` }
-        : { command, args: [target], method: `browser-env:${command}` });
+      try {
+        commands.push(buildBrowserEnvCommand(trimmed, target));
+      } catch (error) {
+        log("info", "ignoring unusable BROWSER entry", { entry: trimmed, error: error.message });
+      }
     }
   }
 
@@ -1690,6 +1707,322 @@ function openBrowserLinuxCommands(target) {
   }
 
   return commands;
+}
+
+function buildBrowserEnvCommand(entry, target) {
+  const [command, ...args] = tokenizeShellWords(entry);
+  const tokens = [command, ...args];
+  const scriptIndex = findScriptArgIndex(tokens);
+
+  if (scriptIndex >= 0) {
+    // Duplicate `-c` tokens mean indexOf may have picked the wrong one don't touch any arg then.
+    // Also ambiguous if a different script flag (-e/-r) is present too, e.g. PHP's own -c <ini-path> alongside its real -r <script>.
+    const isAmbiguous = countScriptIntroducingFlags(tokens) > 1;
+    if (isAmbiguous) {
+      return { args: [...args, target], command, method: `browser-env:${entry}` };
+    }
+
+    const nonShellInterpreter = findNonShellInterpreter(tokens, scriptIndex);
+    if (nonShellInterpreter) {
+      // A non-shell -c interpreter (python, perl, ruby, ...) doesn't use sh.Only substitute a trailing positional %s, never the script text.
+      return buildProtectedScriptCommand(command, args, target, entry, scriptIndex, "-c script", nonShellInterpreter);
+    }
+
+    return buildShellWrapperCommand(command, args, scriptIndex, target, entry);
+  }
+
+  // Same protection as -c above, for perl/ruby/node/lua's -e or php's -r; the interpreter must precede the flag, so a later token can't misroute this.
+  for (const { flag, pattern } of NON_SHELL_EVAL_FLAGS) {
+    const evalScriptIndex = findScriptArgIndex(tokens, flag);
+    if (evalScriptIndex < 0) {
+      continue;
+    }
+    const interpreter = tokens.slice(0, evalScriptIndex).find((token) => pattern.test(String(token).split("/").pop()));
+    if (!interpreter) {
+      continue;
+    }
+    // Found the flag for a recognized interpreter, but not unambiguously: fail closed rather than falling through to unprotected substitution.
+    if (countScriptIntroducingFlags(tokens) > 1) {
+      return { args: [...args, target], command, method: `browser-env:${entry}` };
+    }
+    return buildProtectedScriptCommand(command, args, target, entry, evalScriptIndex, `${flag} script`, interpreter);
+  }
+
+  // No plain -c flag found, but a token still looks like a shell name (e.g.
+  // bundled flags like `-ic`): don't splice %s into any arg, since it could
+  // still end up parsed as script source once that shell reads its flags.
+  // A non-shell interpreter only joins this bucket alongside a bundled-short-flag-shaped token too, or a plain `node script.mjs %s` would be needlessly refused.
+  const hasUnprotectedInterpreter = tokens.some((token) => isShellInterpreterName(token) || isAwkInterpreterName(token))
+    || (tokens.some((token) => isNonShellInterpreterName(token)) && tokens.some((token) => isBundledShortFlagCandidate(token)));
+  if (hasUnprotectedInterpreter) {
+    return { args: [...args, target], command, method: `browser-env:${entry}` };
+  }
+
+  return buildPositionalArgsCommand(command, args, target, entry, 0);
+}
+
+// Shared "leave this script argument alone, substitute only elsewhere" logic; throws if %s is only ever inside that protected argument.
+function buildProtectedScriptCommand(command, args, target, entry, scriptIndex, descriptor, interpreterLabel = command) {
+  const script = args[scriptIndex];
+  const trailingHasPlaceholder = args.slice(scriptIndex + 1).some((arg) => arg.includes("%s"));
+  if (script.includes("%s") && !trailingHasPlaceholder) {
+    throw new ConfigError(`Cannot substitute %s inside a ${interpreterLabel} ${descriptor}; pass the URL as a trailing argument instead: ${entry}`);
+  }
+  return buildPositionalArgsCommand(command, args, target, entry, scriptIndex + 1);
+}
+
+// Rewrites %s inside an explicit `-c` shell script into $0 (quote-aware), and substitutes %s directly in trailing args.
+function buildShellWrapperCommand(command, args, scriptIndex, target, entry) {
+  const script = args[scriptIndex];
+  const { script: rewrittenScript, hasPlaceholder: scriptHasPlaceholder } = substitutePlaceholderInScript(script);
+
+  const before = [...args.slice(0, scriptIndex), rewrittenScript];
+  const after = args.slice(scriptIndex + 1);
+  const trailingHasPlaceholder = after.some((arg) => arg.includes("%s"));
+  const substitutedAfter = trailingHasPlaceholder ? after.map((arg) => arg.replaceAll("%s", target)) : after;
+
+  if (scriptHasPlaceholder) {
+    return { args: [...before, target, ...substitutedAfter], command, method: `browser-env:${entry}` };
+  }
+
+  const finalArgs = trailingHasPlaceholder
+    ? [...before, ...substitutedAfter]
+    : [...before, ...substitutedAfter, target];
+  return { args: finalArgs, command, method: `browser-env:${entry}` };
+}
+
+// Substitutes %s directly into args, and appends the target only when no placeholder was found there.
+function buildPositionalArgsCommand(command, args, target, entry, from) {
+  const before = args.slice(0, from);
+  const after = args.slice(from);
+  const hasPlaceholder = after.some((arg) => arg.includes("%s"));
+  const substitutedAfter = hasPlaceholder ? after.map((arg) => arg.replaceAll("%s", target)) : after;
+  const finalArgs = hasPlaceholder ? [...before, ...substitutedAfter] : [...before, ...substitutedAfter, target];
+  return { args: finalArgs, command, method: `browser-env:${entry}` };
+}
+
+// Rewrites %s in a `-c` script's own text into a valid $0 reference, tracking the script's own quoting.
+function substitutePlaceholderInScript(script) {
+  let output = "";
+  let hasPlaceholder = false;
+  // A stack of nested contexts: $(...) starts a fresh, independent one, even inside an outer double-quoted string.
+  const stack = [{ quote: null }];
+  let index = 0;
+
+  while (index < script.length) {
+    const top = stack[stack.length - 1];
+    const char = script[index];
+
+    if (top.quote === "'") {
+      if (char === "'") {
+        top.quote = null;
+        output += char;
+        index += 1;
+        continue;
+      }
+      if (script.startsWith("%s", index)) {
+        output += `'"$0"'`;
+        hasPlaceholder = true;
+        index += 2;
+        continue;
+      }
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    if (top.quote === '"') {
+      if (char === '"') {
+        top.quote = null;
+        output += char;
+        index += 1;
+        continue;
+      }
+      if (char === "\\" && '"\\$`'.includes(script[index + 1])) {
+        output += char + script[index + 1];
+        index += 2;
+        continue;
+      }
+      if (script.startsWith("$(", index)) {
+        stack.push({ quote: null });
+        output += "$(";
+        index += 2;
+        continue;
+      }
+      // A surviving backslash here would escape the substituted $, turning "\%s" into the dead literal text "\$0" instead of expanding.
+      if (script.startsWith("\\%s", index)) {
+        output += "$0";
+        hasPlaceholder = true;
+        index += 3;
+        continue;
+      }
+      if (script.startsWith("%s", index)) {
+        output += "$0";
+        hasPlaceholder = true;
+        index += 2;
+        continue;
+      }
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    // top.quote === null: bare text, at the top level or inside a $(...); single quotes suppress $(...) so it's only recognized here and in double quotes.
+    if (char === "'" || char === '"') {
+      top.quote = char;
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    if (script.startsWith("$(", index)) {
+      stack.push({ quote: null });
+      output += "$(";
+      index += 2;
+      continue;
+    }
+
+    if (char === ")" && stack.length > 1) {
+      stack.pop();
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    if (script.startsWith("\\%s", index)) {
+      output += '"$0"';
+      hasPlaceholder = true;
+      index += 3;
+      continue;
+    }
+
+    if (char === "\\" && index + 1 < script.length) {
+      output += char + script[index + 1];
+      index += 2;
+      continue;
+    }
+
+    if (script.startsWith("%s", index)) {
+      output += '"$0"';
+      hasPlaceholder = true;
+      index += 2;
+      continue;
+    }
+
+    output += char;
+    index += 1;
+  }
+
+  return { hasPlaceholder, script: output };
+}
+
+function isShellInterpreterName(token) {
+  return typeof token === "string" && SHELL_INTERPRETER_NAMES.has(token.split("/").pop());
+}
+
+function isNonShellInterpreterName(token) {
+  return typeof token === "string" && NON_SHELL_INTERPRETER_PATTERN.test(token.split("/").pop());
+}
+
+function isAwkInterpreterName(token) {
+  return typeof token === "string" && AWK_INTERPRETER_PATTERN.test(token.split("/").pop());
+}
+
+// A short multi-letter flag group (-ic, -pe, ...) that could be bundling a real -c/-e/-r; excludes -c/-e/-r themselves and long --flags.
+function isBundledShortFlagCandidate(token) {
+  return typeof token === "string" && /^-[a-zA-Z]{2,4}$/.test(token);
+}
+
+// Returns the matched interpreter token (for use in error messages), or undefined.
+function findNonShellInterpreter(tokens, scriptIndex) {
+  return tokens.slice(0, scriptIndex).find((token) => isNonShellInterpreterName(token));
+}
+
+// -c always counts (any program could be an unlisted shell). -e/-r only
+// count when a matching interpreter is actually present, so e.g. sh's own
+// unrelated -e (errexit) alongside a real -c doesn't trip this.
+function countScriptIntroducingFlags(tokens) {
+  let count = tokens.filter((token) => token === "-c").length;
+  for (const { flag, pattern } of NON_SHELL_EVAL_FLAGS) {
+    if (tokens.some((token) => pattern.test(String(token).split("/").pop()))) {
+      count += tokens.filter((token) => token === flag).length;
+    }
+  }
+  return count;
+}
+
+// Args-relative index of a script flag's argument (default -c, also used for -e/-r), found anywhere in tokens; -1 if the flag isn't found with something after it.
+function findScriptArgIndex(tokens, flag = "-c") {
+  const flagIndex = tokens.indexOf(flag);
+  if (flagIndex === -1 || typeof tokens[flagIndex + 1] !== "string") {
+    return -1;
+  }
+  return flagIndex; // tokens[flagIndex + 1] (the script) is args[flagIndex].
+}
+
+function tokenizeShellWords(input) {
+  const words = [];
+  let current = "";
+  let hasCurrent = false;
+  let quote = null;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (quote === '"') {
+      if (char === '"') {
+        quote = null;
+      } else if (char === "\\" && '"\\$`'.includes(input[index + 1])) {
+        current += input[index += 1];
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      hasCurrent = true;
+      continue;
+    }
+
+    if (char === "\\" && index + 1 < input.length) {
+      current += input[index += 1];
+      hasCurrent = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (hasCurrent) {
+        words.push(current);
+        current = "";
+        hasCurrent = false;
+      }
+      continue;
+    }
+
+    current += char;
+    hasCurrent = true;
+  }
+
+  if (quote) {
+    throw new ConfigError(`Unterminated ${quote === "'" ? "single" : "double"}-quoted string in BROWSER entry: ${input}`);
+  }
+
+  if (hasCurrent) {
+    words.push(current);
+  }
+
+  return words;
 }
 
 async function openBrowserLinux(target) {
@@ -2206,9 +2539,12 @@ export {
   McpInitializationBarrier,
   OAuthAuthorizationError,
   OAuthFlowCoordinator,
+  buildBrowserEnvCommand,
   completeOAuthAuthorization,
   createOAuthCallbackWaiter,
   fetchWithNodeHttp,
   isSameOrigin,
-  sanitizeRedirectHeaders
+  openBrowserLinuxCommands,
+  sanitizeRedirectHeaders,
+  tokenizeShellWords
 };
