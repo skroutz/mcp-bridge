@@ -20,6 +20,7 @@ const RESERVED_HEADERS = new Set([
   "content-length",
   "content-type",
   "host",
+  "mcp-method",
   "mcp-protocol-version",
   "mcp-session-id",
   "transfer-encoding"
@@ -577,6 +578,30 @@ function makeBridgeFetch(config, defaultTimeoutMs = undefined) {
     } finally {
       clearTimeout(timeout);
     }
+  };
+}
+
+function withMcpMethodHeader(fetchFn) {
+  return (url, init = {}) => {
+    // The SDK serializes each MCP message before calling fetch, but does not
+    // currently add the Mcp-Method header required by some MCP gateways.
+    if (init.method?.toUpperCase() !== "POST" || typeof init.body !== "string") {
+      return fetchFn(url, init);
+    }
+
+    let message;
+    try {
+      message = JSON.parse(init.body);
+    } catch {
+      return fetchFn(url, init);
+    }
+    if (!message || Array.isArray(message) || typeof message.method !== "string") {
+      return fetchFn(url, init);
+    }
+
+    const headers = new Headers(init.headers);
+    headers.set("Mcp-Method", message.method);
+    return fetchFn(url, { ...init, headers });
   };
 }
 
@@ -1865,7 +1890,7 @@ async function startBridge(config) {
     maxBufferSize: config.maxBufferSize
   });
   remoteTransport = new StreamableHTTPClientTransport(config.url, {
-    fetch: oauthFlowCoordinator?.fetch ?? makeBridgeFetch(config),
+    fetch: withMcpMethodHeader(oauthFlowCoordinator?.fetch ?? makeBridgeFetch(config) ?? fetch),
     requestInit: {
       headers: config.headers
     }
@@ -2139,7 +2164,7 @@ async function runOAuthLogin(config) {
 async function connectOAuthClient({ Client, StreamableHTTPClientTransport, config, fetchFn }) {
   const version = await readPackageVersion();
   const transport = new StreamableHTTPClientTransport(config.url, {
-    fetch: fetchFn ?? makeBridgeFetch(config),
+    fetch: withMcpMethodHeader(fetchFn ?? makeBridgeFetch(config) ?? fetch),
     requestInit: {
       headers: config.headers
     }
@@ -2210,5 +2235,6 @@ export {
   createOAuthCallbackWaiter,
   fetchWithNodeHttp,
   isSameOrigin,
-  sanitizeRedirectHeaders
+  sanitizeRedirectHeaders,
+  withMcpMethodHeader
 };
