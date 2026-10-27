@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 process.env.MCP_BRIDGE_TEST_MODE = "1";
 const { BridgeOAuthProvider } = await import("../index.js");
@@ -41,6 +42,14 @@ async function fixture(t) {
     let body = "";
     for await (const chunk of request) body += chunk;
     const message = JSON.parse(body);
+    if (message.method === "server/discover" && request.headers["mcp-method"] !== "server/discover") {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        jsonrpc: "2.0", id: message.id,
+        error: { code: -32020, message: "Mcp-Method header is absent" }
+      }));
+      return;
+    }
     if (message.id === undefined) {
       response.writeHead(202);
       response.end();
@@ -118,6 +127,7 @@ for (const oauth of [true, false]) {
       await client.connect(transport, { timeout: 4_000 });
       if (oauth) f.state.access = undefined;
       assert.deepEqual(await client.listTools({}, { timeout: 4_000 }), { tools: [] });
+      assert.deepEqual(await client.request({ method: "server/discover" }, ListToolsResultSchema, { timeout: 4_000 }), { tools: [] });
       assert.equal(f.state.refreshes, oauth ? 1 : 0);
       if (oauth) assert.equal((await f.provider.tokens()).refresh_token, "new-refresh");
     } catch (error) {

@@ -335,7 +335,7 @@ Precedence is config file, then environment variables, then CLI flags.
 - Healthy requests do not reserve an OAuth callback port. If authorization needs a different callback port, the bridge discards the previous client registration and its tokens together. Replacing or invalidating a client also discards its associated tokens.
 - Credentials embedded in endpoint URLs are rejected. Use environment variables or a config file instead.
 - Static bearer/API-key auth and OAuth browser auth are mutually exclusive modes.
-- Headers controlled by the Streamable-HTTP transport, such as `content-type`, `accept`, `mcp-session-id`, and `mcp-protocol-version`, cannot be overridden.
+- Headers controlled by the Streamable-HTTP transport, such as `content-type`, `accept`, `mcp-session-id`, `mcp-protocol-version`, and `mcp-method`, cannot be overridden. The bridge derives `Mcp-Method` from each outgoing JSON-RPC method so gateways can validate it against the POST body.
 - The bridge sends a Streamable-HTTP session termination request during normal shutdown when the remote server provided a session ID.
 
 ## Local Development
