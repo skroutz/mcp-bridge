@@ -652,3 +652,128 @@ test("awk's bare program argument never executes an injected payload", async () 
 test("gawk's bare program argument never executes an injected payload", async (t) => {
   await assertSpawnDoesNotInject(`gawk 'BEGIN{system("%s")}'`, t);
 });
+
+test("buildBrowserEnvCommand refuses a %s inside a nested shell's program text", () => {
+  for (const entry of [
+    `sh -c 'sh -c "printf %s >/dev/null"'`,
+    `bash -c 'env sh -c "echo %s"'`,
+    `sh -c 'eval "echo %s"'`,
+    `sh -c 'xargs -I{} sh -c "{}" <<< %s'`
+  ]) {
+    assert.throws(() => buildBrowserEnvCommand(entry, target), /Cannot substitute %s/, entry);
+  }
+});
+
+test("buildBrowserEnvCommand refuses a %s handed to an interpreter's inline code from inside a shell script", () => {
+  assert.throws(() => buildBrowserEnvCommand(`sh -c 'python3 -c "print(\\"%s\\")"'`, target), /Cannot substitute %s/);
+  assert.throws(() => buildBrowserEnvCommand(`sh -c 'node -e "console.log(\\"%s\\")"'`, target), /Cannot substitute %s/);
+});
+
+test("buildBrowserEnvCommand still allows a %s passed to an interpreter's script file from inside a shell script", () => {
+  const result = buildBrowserEnvCommand(`sh -c 'node /opt/open-url.mjs %s'`, target);
+  assert.deepEqual(result.args, ["-c", 'node /opt/open-url.mjs "$0"', target]);
+});
+
+test("buildBrowserEnvCommand refuses a %s inside a long or attached interpreter eval option", () => {
+  for (const entry of [
+    `node --eval "console.log('%s')"`,
+    `node --eval=console.log('%s')`,
+    `node -p '"%s"'`,
+    `python3 "-cprint('%s')"`,
+    `perl -E 'say "%s"'`
+  ]) {
+    assert.throws(() => buildBrowserEnvCommand(entry, target), /Cannot substitute %s/, entry);
+  }
+});
+
+test("buildBrowserEnvCommand keeps a bundled ruby eval flag's %s literal and appends the URL as argv", () => {
+  const result = buildBrowserEnvCommand(`ruby -rnet/http -ne 'puts "%s"'`, target);
+  assert.deepEqual(result.args, ["-rnet/http", "-ne", 'puts "%s"', target]);
+});
+
+test("buildBrowserEnvCommand still substitutes %s for an interpreter running a script file or module", () => {
+  assert.deepEqual(buildBrowserEnvCommand("node /opt/open-url.mjs %s", target).args, ["/opt/open-url.mjs", target]);
+  assert.deepEqual(buildBrowserEnvCommand("python3 -m webbrowser %s", target).args, ["-m", "webbrowser", target]);
+  assert.deepEqual(buildBrowserEnvCommand("python3 opener.py --url %s", target).args, ["opener.py", "--url", target]);
+});
+
+test("a nested shell's program text never executes an injected payload because the entry is refused", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const canaryPath = join(directory, "INJECTED");
+    const hostile = `https://mcp.example.test/$(touch ${canaryPath})/cb`;
+    assert.throws(() => buildBrowserEnvCommand(`sh -c 'sh -c "printf %s >/dev/null"'`, hostile), /Cannot substitute %s/);
+    assert.equal(existsSync(canaryPath), false);
+  });
+});
+
+test("openBrowserLinuxCommands skips a refused eval-option entry and keeps trying the rest", () => {
+  const previousBrowser = process.env.BROWSER;
+  process.env.BROWSER = `node --eval "console.log('%s')":w3m`;
+  try {
+    const commands = openBrowserLinuxCommands(target);
+    assert.deepEqual(commands[0], { args: [target], command: "w3m", method: "browser-env:w3m" });
+  } finally {
+    if (previousBrowser === undefined) {
+      delete process.env.BROWSER;
+    } else {
+      process.env.BROWSER = previousBrowser;
+    }
+  }
+});
+
+test("buildBrowserEnvCommand refuses a %s after an interpreter option that merely takes a script-looking value", () => {
+  for (const entry of [
+    `python3 -X a.py "-cprint('%s')"`,
+    `node --title x.js --eval "console.log('%s')"`,
+    `node -r ./preload.js --eval "console.log('%s')"`,
+    `python3 -W x.py "-cprint('%s')"`,
+    `perl -I x.pl "-Eprint '%s'"`,
+    `node -r ./missing.js -p '"%s"'`,
+    `sh -c "python3 -X a.py \\"-cprint('%s')\\""`
+  ]) {
+    assert.throws(() => buildBrowserEnvCommand(entry, target), /Cannot substitute %s/, entry);
+  }
+});
+
+test("buildBrowserEnvCommand fails closed on a value-taking interpreter option before the script, even when the rest looks harmless", () => {
+  assert.throws(() => buildBrowserEnvCommand("node --require ./hook.js app.js --url=%s", target), /Cannot substitute %s/);
+});
+
+test("buildBrowserEnvCommand refuses a %s inside a string argument handed to a command that runs it through a shell", () => {
+  for (const entry of [
+    `sh -c "flock /tmp/mcpb.lock -c \\"echo %s\\""`,
+    `sh -c "script -qc \\"echo %s\\" /dev/null"`,
+    `script -qc "echo %s" /dev/null`
+  ]) {
+    assert.throws(() => buildBrowserEnvCommand(entry, target), /Cannot substitute %s/, entry);
+  }
+});
+
+test("buildBrowserEnvCommand refuses a %s that is the value of a code-taking flag or is piped into an interpreter", () => {
+  for (const entry of [
+    `script -qc %s /dev/null`,
+    `somecmd --eval=%s`,
+    `somecmd -c%s`,
+    `sh -c 'eval %s'`,
+    `sh -c 'echo %s | python3'`,
+    `sh -c 'python3 <<< %s'`,
+    `sh -c 'echo %s | tee /tmp/x | perl'`,
+    `sh -c 'echo %s | at now'`,
+    `sh -c 'at now <<< %s'`,
+    `env -S %s`
+  ]) {
+    assert.throws(() => buildBrowserEnvCommand(entry, target), /Cannot substitute %s/, entry);
+  }
+});
+
+test("buildBrowserEnvCommand allows a %s as a plain argument, a URL-flag value, or a launcher script argument", () => {
+  assert.deepEqual(buildBrowserEnvCommand("chromium --app=%s", target).args, [`--app=${target}`]);
+  assert.deepEqual(buildBrowserEnvCommand("firefox -new-tab %s", target).args, ["-new-tab", target]);
+  assert.deepEqual(buildBrowserEnvCommand("firefox -private %s", target).args, ["-private", target]);
+  assert.deepEqual(buildBrowserEnvCommand("node ./bin/cli %s", target).args, ["./bin/cli", target]);
+  assert.deepEqual(buildBrowserEnvCommand("node --no-warnings app.ts %s", target).args, ["--no-warnings", "app.ts", target]);
+  assert.deepEqual(buildBrowserEnvCommand("python3 ~/bin/open-url %s", target).args, ["~/bin/open-url", target]);
+  assert.deepEqual(buildBrowserEnvCommand("python3 -u -m webbrowser %s", target).args, ["-u", "-m", "webbrowser", target]);
+  assert.deepEqual(buildBrowserEnvCommand("sh -c 'firefox %s; exit'", target).args, ["-c", 'firefox "$0"; exit', target]);
+  assert.deepEqual(buildBrowserEnvCommand("sh -c 'nohup firefox %s >/dev/null 2>&1 &'", target).args, ["-c", 'nohup firefox "$0" >/dev/null 2>&1 &', target]);
+});

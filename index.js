@@ -1783,6 +1783,11 @@ function buildBrowserEnvCommand(entry, target) {
     return { args: [...args, target], command, method: `browser-env:${entry}` };
   }
 
+  const refusal = findUnsafePlaceholderReason(tokens);
+  if (refusal) {
+    throw new ConfigError(`Cannot substitute %s: ${refusal}; pass the URL as a plain argument instead: ${entry}`);
+  }
+
   return buildPositionalArgsCommand(command, args, target, entry, 0);
 }
 
@@ -1800,6 +1805,10 @@ function buildProtectedScriptCommand(command, args, target, entry, scriptIndex, 
 function buildShellWrapperCommand(command, args, scriptIndex, target, entry) {
   const script = args[scriptIndex];
   const { script: rewrittenScript, hasPlaceholder: scriptHasPlaceholder } = substitutePlaceholderInScript(script);
+  const scriptRefusal = scriptHasPlaceholder ? findScriptPlaceholderRefusal(script) : null;
+  if (scriptRefusal) {
+    throw new ConfigError(`Cannot substitute %s into a shell script: ${scriptRefusal}; hand the URL over as a plain argument instead: ${entry}`);
+  }
 
   const before = [...args.slice(0, scriptIndex), rewrittenScript];
   const after = args.slice(scriptIndex + 1);
@@ -1941,6 +1950,85 @@ function substitutePlaceholderInScript(script) {
   return { hasPlaceholder, script: output };
 }
 
+const PLACEHOLDER_SAFE_ARG_PATTERN = /^[A-Za-z0-9_.\/:=@+,~#?&%-]*$/;
+
+const CODE_TAKING_SHORT_FLAG_PATTERN = /^-[A-Za-z]{0,3}[ceS]$/;
+const CODE_TAKING_LONG_FLAGS = new Set(["--eval", "--evaluate", "--exec", "--execute", "--command", "--run", "--print", "--expr", "--expression", "--script", "--code"]);
+
+const INTERPRETER_SAFE_FLAGS = new Set(["-u", "-B", "-E", "-s", "-S", "-O", "-OO", "-q", "-b", "-v", "-w", "-T", "-t", "--trace-warnings"]);
+
+const REEVALUATING_COMMANDS = new Set(["eval", "source", "xargs", "ssh", "su", "watch", "busybox"]);
+
+function isCodeTakingFlag(token) {
+  return typeof token === "string" && (CODE_TAKING_SHORT_FLAG_PATTERN.test(token) || CODE_TAKING_LONG_FLAGS.has(token));
+}
+
+function isInterpreterSafeFlag(token) {
+  return INTERPRETER_SAFE_FLAGS.has(token) || /^--no-[a-z-]+$/.test(token);
+}
+
+function findUnsafePlaceholderReason(words) {
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if (!word.includes("%s")) {
+      continue;
+    }
+    if (!PLACEHOLDER_SAFE_ARG_PATTERN.test(word.replaceAll("%s", ""))) {
+      return `it is embedded in an argument with quotes, spaces or code punctuation ("${word}")`;
+    }
+    if (isCodeTakingFlag(words[index - 1])) {
+      return `it is the value of the code-taking flag ${words[index - 1]}`;
+    }
+    const attachedFlag = /^(-[^=%]*)(?:=|(?=%s))/.exec(word);
+    if (attachedFlag && isCodeTakingFlag(attachedFlag[1])) {
+      return `it is attached to the code-taking flag ${attachedFlag[1]}`;
+    }
+  }
+  return interpreterReachesPlaceholder(words) ? "an interpreter option before its script file could treat it as code" : null;
+}
+
+function interpreterReachesPlaceholder(words) {
+  const starts = words.flatMap((word, index) => (isNonShellInterpreterName(word) ? [index] : []));
+  return starts.some((start, position) => {
+    const end = starts[position + 1] ?? words.length;
+    let programEnd = end;
+    for (let index = start + 1; index < end; index += 1) {
+      const word = words[index];
+      if (word === "-m" && /^python/.test(String(words[start]).split("/").pop()) && index + 1 < end) {
+        programEnd = index + 2;
+        break;
+      }
+      if (isInterpreterSafeFlag(word)) {
+        continue;
+      }
+      programEnd = word.startsWith("-") ? end : index + 1;
+      break;
+    }
+    return words.slice(start + 1, programEnd).some((word) => word.includes("%s"));
+  });
+}
+
+function findScriptPlaceholderRefusal(script) {
+  let words;
+  try {
+    words = tokenizeShellWords(script, { splitOperators: true });
+  } catch {
+    return "the script has unbalanced quoting";
+  }
+  const argumentReason = findUnsafePlaceholderReason(words);
+  if (argumentReason) {
+    return argumentReason;
+  }
+  const basenames = words.map((word) => word.split("/").pop());
+  if (words.some((word, index) => isShellInterpreterName(word) || isAwkInterpreterName(word) || REEVALUATING_COMMANDS.has(basenames[index]))) {
+    return "the script also invokes a nested shell, awk or a command that re-evaluates its arguments";
+  }
+  if (words.some((word) => word === "|" || word === "<")) {
+    return "the script pipes or redirects input, which could feed the URL to a program that runs it as code";
+  }
+  return null;
+}
+
 function isShellInterpreterName(token) {
   return typeof token === "string" && SHELL_INTERPRETER_NAMES.has(token.split("/").pop());
 }
@@ -1985,7 +2073,7 @@ function findScriptArgIndex(tokens, flag = "-c") {
   return flagIndex; // tokens[flagIndex + 1] (the script) is args[flagIndex].
 }
 
-function tokenizeShellWords(input) {
+function tokenizeShellWords(input, { splitOperators = false } = {}) {
   const words = [];
   let current = "";
   let hasCurrent = false;
@@ -2023,6 +2111,16 @@ function tokenizeShellWords(input) {
     if (char === "\\" && index + 1 < input.length) {
       current += input[index += 1];
       hasCurrent = true;
+      continue;
+    }
+
+    if (splitOperators && ";|&<>()`".includes(char)) {
+      if (hasCurrent) {
+        words.push(current);
+        current = "";
+        hasCurrent = false;
+      }
+      words.push(char);
       continue;
     }
 
