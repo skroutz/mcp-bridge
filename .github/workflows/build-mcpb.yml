@@ -18,6 +18,13 @@ on:
       privacy_policies:
         description: "Privacy policy URL"
         required: true
+      auth_mode:
+        description: "Authentication: oauth (browser login/DCR) or bearer (per-user token prompted at install)"
+        type: choice
+        options:
+          - oauth
+          - bearer
+        default: oauth
       ca_bundle_url:
         description: "URL to fetch an optional PEM CA bundle to embed. Leave blank to skip"
         required: false
@@ -91,6 +98,7 @@ jobs:
           MCPB_VERSION: ${{ inputs.version }}
           MCPB_REMOTE_MCP_URL: ${{ inputs.remote_mcp_url }}
           MCPB_PRIVACY_POLICIES: ${{ inputs.privacy_policies }}
+          MCPB_AUTH_MODE: ${{ inputs.auth_mode }}
           CA_BUNDLE_URL: ${{ inputs.ca_bundle_url }}
           CA_BUNDLE_PATH: ${{ runner.temp }}/ca-bundle.pem
         run: |

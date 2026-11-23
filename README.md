@@ -19,6 +19,7 @@ The [`Build MCPB`](.github/workflows/build-mcpb.yml) workflow builds an organiza
 | `version` | Yes | MCPB version to embed in the manifest and filename. |
 | `remote_mcp_url` | Yes | Remote Streamable-HTTP MCP endpoint URL. |
 | `privacy_policies` | Yes | Privacy policy URL to embed in the manifest. |
+| `auth_mode` | No | `oauth` (default) or `bearer`. See [Bearer-Token MCPB](#bearer-token-mcpb). |
 | `ca_bundle_url` | No | URL to fetch an optional PEM CA bundle to embed. Leave blank to build without one. |
 
 The workflow installs production dependencies, optionally downloads the CA bundle over HTTPS, and runs `npm run build:mcpb`. The resulting `.mcpb` is uploaded as a workflow artifact named `<mcpb_name>-mcpb`, retained for specific days.
@@ -143,6 +144,20 @@ npm run build:mcpb
 ```
 
 When `MCPB_REMOTE_MCP_URL` is set, the generated manifest bakes the URL and OAuth callback port directly into the private artifact instead of asking each user to configure them during installation. Override the fixed callback port with `MCPB_OAUTH_CALLBACK_PORT` if needed.
+
+### Bearer-Token MCPB
+
+For remote servers that issue static per-user tokens and do not support OAuth/DCR, set `MCPB_AUTH_MODE=bearer` (the default is `oauth`):
+
+```bash
+MCPB_AUTH_MODE=bearer \
+MCPB_NAME="looppanel-mcp" \
+MCPB_DISPLAY_NAME="Looppanel MCP" \
+MCPB_REMOTE_MCP_URL="https://mcp.example.com/mcp" \
+npm run build:mcpb
+```
+
+The generated manifest omits OAuth settings and adds a required, `sensitive` `bearer_token` user setting that Claude Desktop prompts for at install time and stores in the OS keychain. It is passed to the bridge as `MCP_BRIDGE_BEARER_TOKEN`. No token is embedded in the artifact. Users paste the token only, without the `Bearer ` prefix.
 
 The npm/npx package and MCPB extension require Node.js 24 or newer.
 
