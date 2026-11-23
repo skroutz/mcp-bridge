@@ -93,6 +93,11 @@ function archiveCommand(outputPath) {
 }
 
 function applyManifestOverrides(manifest) {
+  const authMode = parseAuthMode(process.env.MCPB_AUTH_MODE);
+  if (authMode === "bearer") {
+    applyBearerAuth(manifest);
+  }
+
   overrideString(manifest, "name", "MCPB_NAME");
   overrideString(manifest, "display_name", "MCPB_DISPLAY_NAME");
   overrideString(manifest, "description", "MCPB_DESCRIPTION");
@@ -104,13 +109,15 @@ function applyManifestOverrides(manifest) {
     delete manifest.user_config.remote_mcp_url;
   }
 
-  const callbackPort = parseNumber(process.env.MCPB_OAUTH_CALLBACK_PORT)
-    ?? manifest.user_config.oauth_callback_port.default;
-  if (remoteUrl) {
-    manifest.server.mcp_config.env.MCP_BRIDGE_OAUTH_CALLBACK_PORT = String(callbackPort);
-    delete manifest.user_config.oauth_callback_port;
-  } else if (callbackPort) {
-    manifest.user_config.oauth_callback_port.default = callbackPort;
+  if (authMode === "oauth") {
+    const callbackPort = parseNumber(process.env.MCPB_OAUTH_CALLBACK_PORT)
+      ?? manifest.user_config.oauth_callback_port.default;
+    if (remoteUrl) {
+      manifest.server.mcp_config.env.MCP_BRIDGE_OAUTH_CALLBACK_PORT = String(callbackPort);
+      delete manifest.user_config.oauth_callback_port;
+    } else if (callbackPort) {
+      manifest.user_config.oauth_callback_port.default = callbackPort;
+    }
   }
 
   const privacyPolicies = parseList(process.env.MCPB_PRIVACY_POLICIES);
@@ -119,6 +126,34 @@ function applyManifestOverrides(manifest) {
   }
 
   pruneEmptyUserConfig(manifest);
+}
+
+function parseAuthMode(value) {
+  const mode = (value || "oauth").trim().toLowerCase();
+  if (mode !== "oauth" && mode !== "bearer") {
+    throw new Error(`MCPB_AUTH_MODE must be "oauth" or "bearer", got "${value}"`);
+  }
+
+  return mode;
+}
+
+function applyBearerAuth(manifest) {
+  const env = manifest.server.mcp_config.env;
+  delete env.MCP_BRIDGE_OAUTH;
+  delete env.MCP_BRIDGE_OAUTH_CALLBACK_PORT;
+  env.MCP_BRIDGE_BEARER_TOKEN = "${user_config.bearer_token}";
+
+  delete manifest.user_config.oauth_callback_port;
+  manifest.user_config.bearer_token = {
+    type: "string",
+    title: "Access token",
+    description: "Your personal access token for the remote MCP server. Paste the token only, without the \"Bearer \" prefix. It is stored in your OS keychain.",
+    required: true,
+    sensitive: true
+  };
+
+  manifest.long_description = "Connects Claude Desktop to a remote Streamable-HTTP MCP server through a local stdio bridge. Authentication uses a personal access token that each user provides at install time.";
+  manifest.keywords = manifest.keywords.filter((keyword) => keyword !== "oauth");
 }
 
 function overrideString(target, field, envName) {
